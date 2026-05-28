@@ -1,4 +1,15 @@
-from .retriever import GoodMemRetriever, GoodMemConfig
-from .types import GoodMemChunk
+"""GoodMem integration for DeepEval."""
 
-__all__ = ["GoodMemRetriever", "GoodMemConfig", "GoodMemChunk"]
+from deepeval.integrations.goodmem.client import GoodMemClient
+from deepeval.integrations.goodmem.retriever import (
+    GoodMemConfig,
+    GoodMemRetriever,
+)
+from deepeval.integrations.goodmem.types import GoodMemChunk
+
+__all__ = [
+    "GoodMemClient",
+    "GoodMemConfig",
+    "GoodMemRetriever",
+    "GoodMemChunk",
+]

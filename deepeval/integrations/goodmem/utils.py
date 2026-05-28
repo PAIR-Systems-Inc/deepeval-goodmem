@@ -1,99 +1,87 @@
-import json
-from typing import Any, Dict, List, Optional
+"""Parsing and content-type helpers for the GoodMem client."""
 
-import requests
+import json
+from typing import Dict, List, Optional
 
 from deepeval.integrations.goodmem.types import GoodMemChunk
 
+_MIME_TYPES: Dict[str, str] = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "txt": "text/plain",
+    "html": "text/html",
+    "md": "text/markdown",
+    "csv": "text/csv",
+    "json": "application/json",
+    "xml": "application/xml",
+    "doc": "application/msword",
+    "docx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".wordprocessingml.document"
+    ),
+    "xls": "application/vnd.ms-excel",
+    "xlsx": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ),
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".presentationml.presentation"
+    ),
+}
 
-def goodmem_retrieve(
-    base_url: str,
-    api_key: str,
-    space_ids: List[str],
-    query: str,
-    top_k: int = 5,
-    reranker: Optional[str] = None,
-    relevance_threshold: Optional[float] = None,
-    metadata_filter: Optional[str] = None,
-) -> List[GoodMemChunk]:
-    """Execute a semantic retrieval against GoodMem via raw HTTP.
 
-    Returns a list of ``GoodMemChunk`` objects with content, scores, and IDs.
+def get_mime_type(extension: str) -> Optional[str]:
+    """Return the MIME type for a file extension, or `None` if unknown."""
+    return _MIME_TYPES.get(extension.lower().lstrip("."))
+
+
+def parse_ndjson_response(text: str) -> List[GoodMemChunk]:
+    """Parse GoodMem's NDJSON retrieve stream into `GoodMemChunk` objects.
+
+    Lines are tolerated when they are blank, prefixed with `data:` (SSE
+    framing), or fail to parse as JSON; only `retrievedItem` events
+    contribute chunks to the result.
     """
-
-    url = f"{base_url.rstrip('/')}/v1/memories:retrieve"
-
-    space_keys: List[Dict[str, Any]] = []
-    for sid in space_ids:
-        key: Dict[str, Any] = {"spaceId": sid}
-        if metadata_filter:
-            key["filter"] = metadata_filter
-        space_keys.append(key)
-
-    body: Dict[str, Any] = {
-        "message": query,
-        "spaceKeys": space_keys,
-        "requestedSize": top_k,
-        "fetchMemory": True,
-    }
-
-    if reranker:
-        body["postProcessor"] = {
-            "name": "com.goodmem.retrieval.postprocess.ChatPostProcessorFactory",
-            "config": {"reranker_id": reranker},
-        }
-
-    if relevance_threshold is not None:
-        body.setdefault("postProcessor", {}).setdefault("config", {})[
-            "relevance_threshold"
-        ] = relevance_threshold
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/x-ndjson",
-        "x-api-key": api_key,
-    }
-
-    response = requests.post(url, json=body, headers=headers, timeout=30)
-    response.raise_for_status()
-
-    return _parse_ndjson_response(response.text)
-
-
-def _parse_ndjson_response(text: str) -> List[GoodMemChunk]:
-    """Parse GoodMem's NDJSON streaming response into GoodMemChunk objects."""
     chunks: List[GoodMemChunk] = []
 
     for line in text.strip().split("\n"):
-        line = line.strip()
-        if not line:
+        json_str = line.strip()
+        if not json_str:
+            continue
+        if json_str.startswith("data:"):
+            json_str = json_str[5:].strip()
+        if not json_str or json_str.startswith("event:"):
             continue
         try:
-            event = json.loads(line)
+            event = json.loads(json_str)
         except json.JSONDecodeError:
             continue
 
-        if "retrievedItem" in event:
-            item = event["retrievedItem"]
-            chunk_data = item.get("chunk", {})
+        if "retrievedItem" not in event:
+            continue
 
-            # Handle nested chunk structure
-            inner_chunk = chunk_data.get("chunk", chunk_data)
-            chunk_text = inner_chunk.get("chunkText", "")
-            chunk_id = inner_chunk.get("chunkId", "")
-            memory_id = inner_chunk.get("memoryId", "")
-            space_id = inner_chunk.get("spaceId", "")
+        item = event["retrievedItem"]
+        chunk_data = item.get("chunk", {})
+        inner_chunk = chunk_data.get("chunk", chunk_data)
 
-            chunks.append(
-                GoodMemChunk(
-                    content=chunk_text,
-                    score=chunk_data.get(
-                        "relevanceScore", item.get("relevanceScore")
-                    ),
-                    chunk_id=chunk_id,
-                    memory_id=memory_id,
-                    space_id=space_id,
-                )
+        chunks.append(
+            GoodMemChunk(
+                content=inner_chunk.get("chunkText", ""),
+                score=chunk_data.get(
+                    "relevanceScore", item.get("relevanceScore")
+                ),
+                chunk_id=inner_chunk.get("chunkId", ""),
+                memory_id=inner_chunk.get("memoryId", ""),
+                space_id=inner_chunk.get("spaceId", ""),
             )
+        )
 
     return chunks
+
+
+_parse_ndjson_response = parse_ndjson_response

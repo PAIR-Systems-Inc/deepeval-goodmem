@@ -1,10 +1,5 @@
-"""
-Async GoodMem Integration Tests
+"""Asynchronous GoodMem tracing tests."""
 
-Tests that the GoodMem retriever spans work correctly in async contexts.
-"""
-
-import asyncio
 import json
 from unittest.mock import patch, MagicMock
 
@@ -14,9 +9,11 @@ from deepeval.tracing import trace, observe
 from deepeval.tracing.tracing import trace_manager
 from deepeval.tracing.types import RetrieverSpan, TraceSpanStatus
 
-from deepeval.integrations.goodmem import GoodMemRetriever, GoodMemConfig, GoodMemChunk
-
-# --- Fixtures ----------------------------------------------------------------
+from deepeval.integrations.goodmem import (
+    GoodMemChunk,
+    GoodMemConfig,
+    GoodMemRetriever,
+)
 
 MOCK_NDJSON = "\n".join(
     [
@@ -72,23 +69,14 @@ def retriever():
     )
 
 
-# --- Async Trace Tests -------------------------------------------------------
-
-
 class TestAsyncRetrieverSpan:
-    """Verify retriever spans work when called from async code."""
+    """Retriever spans should be recorded when called from async code."""
 
     @pytest.mark.asyncio
-    @patch(
-        "deepeval.integrations.goodmem.utils.requests.post",
-        side_effect=_mock_post,
-    )
+    @patch("requests.Session.post", side_effect=_mock_post)
     async def test_async_context_creates_span(self, mock_post, retriever):
-        """Calling retrieve() from an async function should still create a span."""
-
         @observe(type="agent", name="Async RAG Agent")
         async def async_rag(query):
-            # retrieve() is sync but called from async context
             return retriever.retrieve(query)
 
         with trace(name="async-goodmem-test"):
@@ -108,13 +96,8 @@ class TestAsyncRetrieverSpan:
         assert retriever_span.status == TraceSpanStatus.SUCCESS
 
     @pytest.mark.asyncio
-    @patch(
-        "deepeval.integrations.goodmem.utils.requests.post",
-        side_effect=_mock_post,
-    )
+    @patch("requests.Session.post", side_effect=_mock_post)
     async def test_sequential_async_retrieves(self, mock_post, retriever):
-        """Sequential retrieve() calls from async should each create a traced span."""
-
         @observe(type="agent", name="Multi-Retrieve Agent")
         async def multi_retrieve(queries):
             results = []
@@ -135,13 +118,10 @@ class TestAsyncRetrieverSpan:
 
 
 class TestAsyncRetrieveChunks:
-    """Verify retrieve_chunks() works in async contexts."""
+    """`retrieve_chunks()` should work the same under async code."""
 
     @pytest.mark.asyncio
-    @patch(
-        "deepeval.integrations.goodmem.utils.requests.post",
-        side_effect=_mock_post,
-    )
+    @patch("requests.Session.post", side_effect=_mock_post)
     async def test_async_retrieve_chunks(self, mock_post, retriever):
         @observe(type="agent", name="Async Chunks Agent")
         async def async_chunks(query):

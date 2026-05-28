@@ -1,18 +1,16 @@
-"""
-Integration test: GoodMem retrieval → OpenAI generation → DeepEval evaluation.
+"""End-to-end test: GoodMem retrieval, OpenAI generation, DeepEval metrics.
 
-Requires a running GoodMem instance with a populated space and an OpenAI key.
-Skipped automatically unless all required env vars are set.
+Skipped automatically unless every required environment variable is set.
 
-Run with::
+Run with:
 
     pytest tests/test_integrations/test_goodmem/test_integration.py -m integration -v
 
 Required env vars:
-    GOODMEM_BASE_URL   – e.g. https://api.goodmem.ai
-    GOODMEM_API_KEY    – GoodMem API key
-    GOODMEM_SPACE_ID   – Space ID containing retrievable content
-    OPENAI_API_KEY     – OpenAI API key for generation and metrics
+    GOODMEM_BASE_URL   GoodMem server URL, e.g. https://localhost:8080.
+    GOODMEM_API_KEY    GoodMem API key.
+    GOODMEM_SPACE_ID   Space ID with retrievable content.
+    OPENAI_API_KEY     OpenAI API key for generation and metrics.
 """
 
 import os
@@ -64,13 +62,8 @@ SYSTEM_PROMPT = (
 GENERATION_MODEL = "gpt-4o-mini"
 
 
-# ---------------------------------------------------------------------------
-# Retrieval tests
-# ---------------------------------------------------------------------------
-
-
 class TestRetrieve:
-    """Verify that live retrieval returns usable results."""
+    """Live retrieval should return usable results."""
 
     def test_retrieve_returns_strings(self, retriever):
         results = retriever.retrieve("What is energy?")
@@ -98,13 +91,8 @@ class TestRetrieve:
         assert len(chunks) <= retriever.config.top_k
 
 
-# ---------------------------------------------------------------------------
-# RAG pipeline test
-# ---------------------------------------------------------------------------
-
-
 class TestRAGPipeline:
-    """End-to-end: retrieve → generate → evaluate with DeepEval metrics."""
+    """Retrieve, generate, and evaluate with DeepEval metrics."""
 
     @staticmethod
     def _generate(client, chunks, query):
@@ -114,14 +102,16 @@ class TestRAGPipeline:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": f"Context:\n{chr(10).join(chunks)}\n\nQuestion: {query}",
+                    "content": (
+                        f"Context:\n{chr(10).join(chunks)}\n\n"
+                        f"Question: {query}"
+                    ),
                 },
             ],
         )
         return response.choices[0].message.content
 
     def test_rag_answer_relevancy(self, retriever, openai_client):
-        """Retrieve, generate, and verify answer relevancy score."""
         from deepeval.metrics import AnswerRelevancyMetric
         from deepeval.test_case import LLMTestCase
 
@@ -141,7 +131,6 @@ class TestRAGPipeline:
         assert metric.score >= 0.0
 
     def test_rag_contextual_relevancy(self, retriever, openai_client):
-        """Retrieve, generate, and verify contextual relevancy score."""
         from deepeval.metrics import ContextualRelevancyMetric
         from deepeval.test_case import LLMTestCase
 
@@ -161,7 +150,6 @@ class TestRAGPipeline:
         assert metric.score >= 0.0
 
     def test_batch_evaluate(self, retriever, openai_client):
-        """Build multiple test cases and run batch evaluation."""
         from deepeval import evaluate
         from deepeval.evaluate import AsyncConfig
         from deepeval.metrics import AnswerRelevancyMetric

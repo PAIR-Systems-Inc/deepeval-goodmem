@@ -1,8 +1,8 @@
 import os
 import uuid
 import pytest
-from deepeval.metrics import GEval
-from deepeval.test_case import LLMTestCaseParams
+from deepeval.metrics import GEval, ConversationalGEval
+from deepeval.test_case import SingleTurnParams, MultiTurnParams
 from deepeval.metrics.g_eval import Rubric
 from deepeval.confident.api import Api, HttpMethods, Endpoints
 from deepeval.confident.types import ConfidentApiError
@@ -25,12 +25,14 @@ class TestGEval:
         metric = GEval(
             name=metric_name,
             evaluation_params=[
-                LLMTestCaseParams.INPUT,
-                LLMTestCaseParams.ACTUAL_OUTPUT,
-                LLMTestCaseParams.EXPECTED_OUTPUT,
-                LLMTestCaseParams.CONTEXT,
-                # LLMTestCaseParams.TOOLS_CALLED,
-                LLMTestCaseParams.RETRIEVAL_CONTEXT,
+                SingleTurnParams.INPUT,
+                SingleTurnParams.ACTUAL_OUTPUT,
+                SingleTurnParams.EXPECTED_OUTPUT,
+                SingleTurnParams.CONTEXT,
+                # SingleTurnParams.TOOLS_CALLED,
+                SingleTurnParams.RETRIEVAL_CONTEXT,
+                SingleTurnParams.METADATA,
+                SingleTurnParams.TAGS,
             ],
             criteria="Test whether actual output is relevant to the input given",
             rubric=[
@@ -63,16 +65,45 @@ class TestGEval:
             "context",
             # "toolsCalled",
             "retrievalContext",
+            "metadata",
+            "tags",
         }
 
         duplicate_metric = GEval(
             name=metric_name,
             evaluation_params=[
-                LLMTestCaseParams.INPUT,
-                LLMTestCaseParams.ACTUAL_OUTPUT,
+                SingleTurnParams.INPUT,
+                SingleTurnParams.ACTUAL_OUTPUT,
             ],
             criteria="Test whether actual output is relevant to the input given",
         )
 
         with pytest.raises(ConfidentApiError):
             duplicate_metric.upload()
+
+        pulled_metric = GEval(name=metric_name)
+        pulled_response = pulled_metric.pull()
+
+        assert pulled_response.id == metric_id
+        assert pulled_metric.metric_id == metric_id
+        assert pulled_metric.criteria == metric.criteria
+        assert pulled_metric.evaluation_steps == metric.evaluation_steps
+        assert set(pulled_metric.evaluation_params) == set(
+            metric.evaluation_params
+        )
+        assert pulled_metric.rubric is not None
+        assert len(pulled_metric.rubric) == len(metric.rubric)
+
+    def test_geval_pull_rejects_multi_turn_metric(self):
+        metric_name = str(uuid.uuid4())
+
+        metric = ConversationalGEval(
+            name=metric_name,
+            evaluation_params=[MultiTurnParams.SCENARIO],
+            criteria="Conversation quality metric",
+        )
+        metric.upload()
+
+        pulled_metric = GEval(name=metric_name)
+        with pytest.raises(ValueError):
+            pulled_metric.pull()

@@ -1,3 +1,5 @@
+import json
+import re
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -19,6 +21,7 @@ import random
 import atexit
 import queue
 import uuid
+from deepeval.test_case import MLLMImage
 from openai import OpenAI
 from rich.console import Console
 from rich.progress import Progress
@@ -36,6 +39,7 @@ from deepeval.tracing.api import (
     SpanApiType,
     TraceApi,
     TraceSpanApiStatus,
+    AttachmentApi,
 )
 from deepeval.telemetry import capture_send_trace
 from deepeval.tracing.patchers import (
@@ -45,6 +49,8 @@ from deepeval.tracing.patchers import (
 from deepeval.tracing.types import (
     AgentSpan,
     BaseSpan,
+    EvalMode,
+    EvalSession,
     LlmSpan,
     RetrieverSpan,
     SpanType,
@@ -58,6 +64,7 @@ from deepeval.tracing.utils import (
     prepare_tool_call_input_parameters,
     replace_self_with_class_name,
     make_json_serializable,
+    normalize_trace_api_span_providers,
     perf_counter_to_datetime,
     to_zod_compatible_iso,
     tracing_enabled,
@@ -65,10 +72,16 @@ from deepeval.tracing.utils import (
     validate_sampling_rate,
 )
 from deepeval.utils import dataclass_to_dict
-from deepeval.tracing.context import current_span_context, current_trace_context
+from deepeval.tracing.context import (
+    apply_pending_to_span,
+    current_span_context,
+    current_trace_context,
+    pop_pending_for,
+)
 from deepeval.tracing.types import TestCaseMetricPair
 from deepeval.tracing.api import PromptApi
 from deepeval.tracing.trace_test_manager import trace_testing_manager
+from deepeval.test_case.llm_test_case import _MLLM_IMAGE_REGISTRY
 
 if TYPE_CHECKING:
     from deepeval.dataset.golden import Golden
@@ -161,10 +174,6 @@ class TraceManager:
         self.active_spans: Dict[str, BaseSpan] = (
             {}
         )  # Map of span_uuid to BaseSpan
-        # Map each trace created during evaluation_loop to the Golden that was active
-        # when it was started. This lets us evaluate traces against the correct golden
-        # since we cannot rely on positional indexing as the order is not guaranteed.
-        self.trace_uuid_to_golden: Dict[str, Golden] = {}
 
         settings = get_settings()
         # Initialize queue and worker thread for trace posting
@@ -195,13 +204,12 @@ class TraceManager:
         self.openai_client = None
         self.tracing_enabled = True
 
-        # Evals
-        self.evaluating = False
-        self.evaluation_loop = False
-        self.traces_to_evaluate_order: List[str] = []
-        self.traces_to_evaluate: List[Trace] = []
-        self.integration_traces_to_evaluate: List[Trace] = []
-        self.test_case_metrics: List[TestCaseMetricPair] = []
+        # All per-evaluation-run state is grouped on this single object.
+        # See deepeval.tracing.types.EvalSession for the field-by-field
+        # breakdown. Resetting an in-flight evaluation is a one-line
+        # ``self.eval_session = EvalSession()``, which makes exit cleanup
+        # atomic and impossible to half-do.
+        self.eval_session: EvalSession = EvalSession()
 
         # Register an exit handler to warn about unprocessed traces
         atexit.register(self._warn_on_exit)
@@ -217,6 +225,20 @@ class TraceManager:
                 trace_worker_status=TraceWorkerStatus.WARNING,
                 description=f"Set {CONFIDENT_TRACE_FLUSH}=1 as an environment variable to flush remaining traces to Confident AI.",
             )
+
+    @property
+    def is_evaluating(self) -> bool:
+        """True when running under any evaluation pipeline (any non-OFF mode).
+
+        Delegates to ``eval_session`` so external callers don't need to know
+        about the session indirection.
+        """
+        return self.eval_session.is_evaluating
+
+    @property
+    def is_iterator(self) -> bool:
+        """True when running under either evals_iterator path (sync or async)."""
+        return self.eval_session.is_iterator
 
     def mask(self, data: Any):
         if self.custom_mask_fn is not None:
@@ -272,8 +294,8 @@ class TraceManager:
         )
         self.active_traces[trace_uuid] = new_trace
         self.traces.append(new_trace)
-        if self.evaluation_loop:
-            self.traces_to_evaluate_order.append(trace_uuid)
+        if self.eval_session.mode == EvalMode.ITERATOR_ASYNC:
+            self.eval_session.pending_traces[trace_uuid] = new_trace
             # Associate the current Golden with this trace so we can
             # later evaluate traces against the correct golden, even if more traces
             # are created than goldens or the order interleaves.
@@ -282,7 +304,9 @@ class TraceManager:
 
                 current_golden = get_current_golden()
                 if current_golden is not None:
-                    self.trace_uuid_to_golden[trace_uuid] = current_golden
+                    self.eval_session.trace_uuid_to_golden[trace_uuid] = (
+                        current_golden
+                    )
             except Exception:
                 # not much we can do, but if the golden is not there during evaluation
                 # we will write out a verbose debug log
@@ -312,20 +336,31 @@ class TraceManager:
                 )
                 trace_testing_manager.test_dict = make_json_serializable(body)
             #  Post the trace to the server before removing it
-            elif not self.evaluating:
-                self.post_trace(trace)
+            elif not self.is_evaluating:
+                if not trace.drop:
+                    self.post_trace(trace)
             else:
-                if self.evaluation_loop:
-                    if self.integration_traces_to_evaluate:
+                if self.eval_session.mode == EvalMode.ITERATOR_ASYNC:
+                    session = self.eval_session
+                    if session.test_case_metrics:
                         pass
-                    elif self.test_case_metrics:
-                        pass
-                    elif trace_uuid in self.traces_to_evaluate_order:
-                        self.traces_to_evaluate.append(trace)
-                        self.traces_to_evaluate.sort(
-                            key=lambda t: self.traces_to_evaluate_order.index(
-                                t.uuid
-                            )
+                    elif (
+                        trace_uuid in session.pending_traces
+                        and trace not in session.traces_to_evaluate
+                    ):
+                        # Per-trace dedup: an integration may have already
+                        # queued this exact trace before calling end_trace
+                        # (e.g. llama_index does this in prepare_to_exit_span).
+                        session.traces_to_evaluate.append(trace)
+                        # Sort by start order. `pending_traces` is insertion-
+                        # ordered, so build the position map once instead of
+                        # doing an O(n) `index()` lookup per comparison.
+                        order = {
+                            uuid: i
+                            for i, uuid in enumerate(session.pending_traces)
+                        }
+                        session.traces_to_evaluate.sort(
+                            key=lambda t: order.get(t.uuid, len(order))
                         )
                 else:
                     # print(f"Ending trace: {trace.root_spans}")
@@ -342,6 +377,14 @@ class TraceManager:
 
             # Remove from active traces
             del self.active_traces[trace_uuid]
+
+            # Evict finished traces to bound memory usage.
+            # Skipped during evaluation (pipeline reads them after completion).
+            if not self.is_evaluating:
+                try:
+                    self.traces.remove(trace)
+                except ValueError:
+                    pass
 
     def set_trace_status(self, trace_uuid: str, status: TraceSpanStatus):
         """Manually set the status of a trace."""
@@ -382,11 +425,41 @@ class TraceManager:
                     span.parent_uuid = None
                     trace.root_spans.remove(parent_span)
                     trace.root_spans.append(span)
+                    self._reparent_orphan_roots(trace, span)
                     return
 
                 parent_span.children.append(span)
             else:
                 trace.root_spans.append(span)
+
+        # Adopt any already-rooted spans whose ``parent_uuid`` matches this
+        # span. Without this step, the OTel-via-SimpleSpanProcessor flow
+        # produces sibling roots when a child's ``on_end`` lands at the
+        # exporter BEFORE its parent's: the exporter calls add_span_to_trace
+        # for the child first, finds no parent in ``active_spans``, and parks
+        # the child in ``root_spans``. When the parent finally arrives we
+        # need to re-knit the tree, otherwise the trace ships with multiple
+        # logical roots and downstream walkers (e.g. the evals_iterator DFS
+        # which only visits ``root_spans[0]``) silently drop subtrees.
+        self._reparent_orphan_roots(trace, span)
+
+    @staticmethod
+    def _reparent_orphan_roots(trace: Trace, parent: BaseSpan) -> None:
+        """Move root_spans whose ``parent_uuid == parent.uuid`` under
+        ``parent`` and remove them from ``trace.root_spans``.
+
+        Mutates ``trace.root_spans`` and ``parent.children`` in place. No-op
+        if no orphan roots match. Iterates a snapshot of ``root_spans`` so we
+        can safely remove items as we go.
+        """
+        if not trace.root_spans:
+            return
+        for orphan in list(trace.root_spans):
+            if orphan is parent:
+                continue
+            if orphan.parent_uuid == parent.uuid:
+                trace.root_spans.remove(orphan)
+                parent.children.append(orphan)
 
     def get_trace_by_uuid(self, trace_uuid: str) -> Optional[Trace]:
         """Get a trace by its UUID."""
@@ -421,7 +494,7 @@ class TraceManager:
         description: Optional[str] = None,
         environment: Optional[str] = None,
     ):
-        if get_settings().CONFIDENT_TRACE_VERBOSE and self.evaluating is False:
+        if get_settings().CONFIDENT_TRACE_VERBOSE and not self.is_evaluating:
             console = Console()
             message_prefix = "[dim][Confident AI Trace Log][/dim]"
             if trace_worker_status == TraceWorkerStatus.SUCCESS:
@@ -526,6 +599,7 @@ class TraceManager:
                 # Build API object & payload
                 if isinstance(trace_obj, TraceApi):
                     trace_api = trace_obj
+                    normalize_trace_api_span_providers(trace_api)
                 else:
                     trace_api = self.create_trace_api(trace_obj)
 
@@ -635,6 +709,7 @@ class TraceManager:
         for trace_api in remaining_traces:
             with capture_send_trace():
                 try:
+                    normalize_trace_api_span_providers(trace_api)
                     try:
                         body = trace_api.model_dump(
                             by_alias=True,
@@ -710,8 +785,24 @@ class TraceManager:
         # Process all spans in the trace iteratively
         span_stack = list(trace.root_spans)  # Start with root spans
 
+        merged_attachment_docs: Dict[str, MLLMImage] = {}
+        trace_docs = self._extract_attachments(trace)
+        if trace_docs:
+            merged_attachment_docs.update(trace_docs)
+
         while span_stack:
             span = span_stack.pop()
+
+            if span.drop:
+                if span.children:
+                    for child in span.children:
+                        child.parent_uuid = span.parent_uuid
+                    span_stack.extend(span.children)
+                continue
+
+            span_docs = self._extract_attachments(span)
+            if span_docs:
+                merged_attachment_docs.update(span_docs)
 
             # Convert BaseSpan to BaseApiSpan
             api_span = self._convert_span_to_api_span(span)
@@ -746,7 +837,17 @@ class TraceManager:
             perf_counter_to_datetime(effective_end_time)
         )
 
-        return TraceApi(
+        api_attachments = None
+        if merged_attachment_docs:
+            api_attachments = {}
+            for doc_id, doc in merged_attachment_docs.items():
+                api_attachments[doc_id] = AttachmentApi(
+                    url=doc.url,
+                    mimeType=doc.mimeType,
+                    dataBase64=doc.dataBase64,
+                )
+
+        trace_api = TraceApi(
             uuid=trace.uuid,
             baseSpans=base_spans,
             agentSpans=agent_spans,
@@ -763,12 +864,20 @@ class TraceManager:
             input=trace.input,
             output=trace.output,
             metricCollection=trace.metric_collection,
-            retrievalContext=trace.retrieval_context,
+            retrievalContext=(
+                [
+                    rc.context if hasattr(rc, "context") else rc
+                    for rc in trace.retrieval_context
+                ]
+                if trace.retrieval_context
+                else None
+            ),
             context=trace.context,
             expectedOutput=trace.expected_output,
             toolsCalled=trace.tools_called,
             expectedTools=trace.expected_tools,
             testCaseId=trace.test_case_id,
+            turnId=trace.turn_id,
             confident_api_key=trace.confident_api_key,
             environment=(
                 self.environment if not trace.environment else trace.environment
@@ -778,7 +887,10 @@ class TraceManager:
                 if trace.status == TraceSpanStatus.SUCCESS
                 else TraceSpanApiStatus.ERRORED
             ),
+            attachments=api_attachments,
         )
+        normalize_trace_api_span_providers(trace_api)
+        return trace_api
 
     def _convert_span_to_api_span(self, span: BaseSpan) -> BaseApiSpan:
         # Determine span type
@@ -825,13 +937,21 @@ class TraceManager:
             output=output_data,
             metadata=span.metadata,
             error=span.error,
+            integration=span.integration,
             metricCollection=span.metric_collection,
             metricsData=(
                 [create_metric_data(metric) for metric in span.metrics]
                 if span.metrics
                 else None
             ),
-            retrievalContext=span.retrieval_context,
+            retrievalContext=(
+                [
+                    rc.context if hasattr(rc, "context") else rc
+                    for rc in span.retrieval_context
+                ]
+                if span.retrieval_context
+                else None
+            ),
             context=span.context,
             expectedOutput=span.expected_output,
             toolsCalled=span.tools_called,
@@ -850,6 +970,7 @@ class TraceManager:
             api_span.chunk_size = span.chunk_size
         elif isinstance(span, LlmSpan):
             api_span.model = span.model
+            api_span.provider = span.provider
             # api_span.prompt = PromptApi(alias=alias, version=version, hash=hash) # Legacy won't be using anymore
             api_span.cost_per_input_token = span.cost_per_input_token
             api_span.cost_per_output_token = span.cost_per_output_token
@@ -880,6 +1001,29 @@ class TraceManager:
                 api_span.token_intervals = processed_token_intervals
 
         return api_span
+
+    def _extract_attachments(
+        self, obj: Union[Trace, BaseSpan]
+    ) -> Optional[Dict[str, MLLMImage]]:
+        """Scans an object's attributes for multimodal slugs and pulls them from the global registry."""
+        pattern = r"\[DEEPEVAL:(?:IMAGE|PDF):(.*?)]"
+        found_docs: Dict[str, MLLMImage] = {}
+
+        # Supported fields that may contain multimodal content
+        fields_to_scan = [
+            obj.input,
+            obj.output,
+            obj.context,
+            obj.retrieval_context,
+            obj.expected_output,
+        ]
+
+        matches = re.findall(pattern, str(fields_to_scan))
+        for doc_id in matches:
+            if doc_id in _MLLM_IMAGE_REGISTRY:
+                found_docs[doc_id] = _MLLM_IMAGE_REGISTRY[doc_id]
+
+        return found_docs if found_docs else None
 
 
 trace_manager = TraceManager()
@@ -952,6 +1096,23 @@ class Observer:
 
         # Now create the span instance with the correct trace_uuid and parent_uuid
         span_instance = self.create_span_instance()
+
+        # Apply any ``next_*_span(...)`` defaults the user staged before
+        # we push the span into context, so ``update_current_span(...)``
+        # and downstream readers see them as the baseline. Mirrors what
+        # ``SpanInterceptor.on_start`` does for the OTel path; without
+        # this the native ``@observe`` path silently drops staged
+        # ``metrics``/``available_tools``/etc.
+        pending = pop_pending_for(self.span_type)
+        if pending:
+            apply_pending_to_span(span_instance, pending)
+
+        if (
+            parent_span
+            and not getattr(span_instance, "integration", None)
+            and getattr(parent_span, "integration", None)
+        ):
+            span_instance.integration = parent_span.integration
 
         # stash call arguments so they are available during the span lifetime
         setattr(span_instance, "_function_kwargs", self.function_kwargs)
@@ -1159,27 +1320,37 @@ def observe(
     type: Optional[
         Union[Literal["agent", "llm", "retriever", "tool"], str]
     ] = None,
+    _drop_if_root: bool = False,
+    _internal: bool = False,
     **observe_kwargs,
 ):
     """
     Decorator to trace a function as a span.
 
     Args:
-        span_type: The type of span to create (AGENT, LLM, RETRIEVER, TOOL, or custom string)
-        **observe_kwargs: Additional arguments to pass to the Observer
-
-    Returns:
-        A decorator function that wraps the original function with a Observer
+        type: The type of span to create (agent, llm, retriever, tool, or custom string).
+        _drop_if_root: If True, skip observation when there is no active parent span.
+        _internal: If True, only observe when CONFIDENT_TRACE_INTERNAL is enabled.
+        **observe_kwargs: Additional arguments to pass to the Observer.
     """
 
     def decorator(func):
         func_name = func.__name__  # Get func_name outside wrappers
+
+        def _should_skip_observe():
+            if _drop_if_root and current_span_context.get() is None:
+                return True
+            if _internal and not get_settings().CONFIDENT_TRACE_INTERNAL:
+                return True
+            return False
 
         # Async generator function
         if inspect.isasyncgenfunction(func):
 
             @functools.wraps(func)
             def asyncgen_wrapper(*args, **func_kwargs):
+                if _should_skip_observe():
+                    return func(*args, **func_kwargs)
 
                 sig = inspect.signature(func)
                 bound = sig.bind(*args, **func_kwargs)
@@ -1214,6 +1385,8 @@ def observe(
 
             @functools.wraps(func)
             def gen_wrapper(*args, **func_kwargs):
+                if _should_skip_observe():
+                    return func(*args, **func_kwargs)
 
                 sig = inspect.signature(func)
                 bound = sig.bind(*args, **func_kwargs)
@@ -1290,7 +1463,8 @@ def observe(
 
             @functools.wraps(func)
             async def async_wrapper(*args, **func_kwargs):
-                # func_name = func.__name__ # Removed from here
+                if _should_skip_observe():
+                    return await func(*args, **func_kwargs)
                 sig = inspect.signature(func)
                 bound_args = sig.bind(*args, **func_kwargs)
                 bound_args.apply_defaults()
@@ -1321,7 +1495,8 @@ def observe(
 
             @functools.wraps(func)
             def wrapper(*args, **func_kwargs):
-                # func_name = func.__name__ # Removed from here
+                if _should_skip_observe():
+                    return func(*args, **func_kwargs)
                 sig = inspect.signature(func)
                 bound_args = sig.bind(*args, **func_kwargs)
                 bound_args.apply_defaults()

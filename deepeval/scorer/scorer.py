@@ -166,8 +166,12 @@ class Scorer:
         except ModuleNotFoundError as e:
             print("Please install torch module. Command: pip install torch")
 
-        # FIXME: Fix the case for mps
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
         bert_scorer = BERTScorer(
             model_type=model,
             lang=lang,
@@ -440,7 +444,8 @@ class Scorer:
         evaluation_model: DeepEvalBaseLLM,
         using_native_evaluation_model: bool,
     ):
-        prompt = textwrap.dedent(f"""
+        prompt = textwrap.dedent(
+            f"""
             Given the question and context, evaluate if the prediction is correct based on the expected output.
             Ensure to account for cases where the prediction and expected output might differ in form, such as '2' versus 'two'.
 
@@ -454,7 +459,8 @@ class Scorer:
             {{
                 "answer": <number>
             }}
-        """)
+        """
+        )
 
         # Generate the score using the model
         if using_native_evaluation_model:

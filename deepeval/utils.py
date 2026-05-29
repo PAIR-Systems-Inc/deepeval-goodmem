@@ -83,7 +83,6 @@ class TurnLike(Protocol):
     user_id: Optional[str]
     retrieval_context: Optional[Sequence[str]]
     tools_called: Optional[Sequence[Any]]
-    additional_metadata: Optional[Dict[str, Any]]
     comments: Optional[str]
 
 
@@ -124,7 +123,7 @@ def convert_keys_to_snake_case(data: Any) -> Any:
         new_dict = {}
         for k, v in data.items():
             new_key = camel_to_snake(k)
-            if k == "additionalMetadata":
+            if k == "additionalMetadata" or k == "metadata":
                 new_dict[new_key] = (
                     v  # Convert key but do not recurse into value
                 )
@@ -577,7 +576,7 @@ def convert_to_multi_modal_array(input: Union[str, List[str]]):
 
 
 def check_if_multimodal(input: str):
-    pattern = r"\[DEEPEVAL:IMAGE:(.*?)\]"
+    pattern = r"\[DEEPEVAL:(?:IMAGE|PDF):(.*?)\]"
     matches = list(re.finditer(pattern, input))
     return bool(matches)
 
@@ -632,7 +631,10 @@ def format_turn(
     if rctx:
         show = rctx[:max_context_items]
         for i, item in enumerate(show):
-            lines.append(f"{indent}↳ ctx[{i}]: {shorten(item, context_length)}")
+            item_str = item.context if hasattr(item, "context") else item
+            lines.append(
+                f"{indent}↳ ctx[{i}]: {shorten(item_str, context_length)}"
+            )
         hidden = max(0, len(rctx) - len(show))
         if hidden:
             lines.append(f"{indent}↳ ctx: (+{hidden} more)")
@@ -641,17 +643,6 @@ def format_turn(
         lines.append(
             f"{indent}↳ comment: {shorten(str(turn.comments), meta_length)}"
         )
-
-    meta = turn.additional_metadata or {}
-    if isinstance(meta, dict):
-        for k in list(meta.keys())[:3]:
-            if k in {"user_id", "userId"}:
-                continue
-            v = meta.get(k)
-            if v is not None:
-                lines.append(
-                    f"{indent}↳ meta.{k}: {shorten(str(v), meta_length)}"
-                )
 
     return "\n".join(lines)
 

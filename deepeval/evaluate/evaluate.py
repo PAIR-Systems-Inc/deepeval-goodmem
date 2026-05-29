@@ -1,11 +1,9 @@
+import os
 from typing import (
-    Callable,
     List,
     Optional,
     Union,
     Dict,
-    Any,
-    Awaitable,
 )
 from rich.console import Console
 import time
@@ -21,10 +19,8 @@ from deepeval.evaluate.configs import (
 from deepeval.evaluate.utils import (
     validate_assert_test_inputs,
     validate_evaluate_inputs,
-    print_test_result,
-    aggregate_metric_pass_rates,
-    write_test_result_to_file,
 )
+from deepeval.evaluate.console_report import EvaluationConsoleReport
 from deepeval.dataset import Golden
 from deepeval.prompt import Prompt
 from deepeval.test_case.utils import check_valid_test_cases_type
@@ -61,9 +57,8 @@ from deepeval.test_run import (
 from deepeval.utils import get_is_running_deepeval
 from deepeval.evaluate.types import EvaluationResult
 from deepeval.evaluate.execute import (
-    a_execute_agentic_test_cases,
     a_execute_test_cases,
-    execute_agentic_test_cases,
+    _assert_test_from_current_trace,
     execute_test_cases,
 )
 
@@ -77,14 +72,10 @@ def assert_test(
         ]
     ] = None,
     golden: Optional[Golden] = None,
-    observed_callback: Optional[
-        Union[Callable[[str], Any], Callable[[str], Awaitable[Any]]]
-    ] = None,
     run_async: bool = True,
 ):
     validate_assert_test_inputs(
         golden=golden,
-        observed_callback=observed_callback,
         test_case=test_case,
         metrics=metrics,
     )
@@ -101,33 +92,14 @@ def assert_test(
         write_cache=get_is_running_deepeval(), use_cache=should_use_cache()
     )
 
-    if golden and observed_callback:
-        if run_async:
-            loop = get_or_create_event_loop()
-            test_result = loop.run_until_complete(
-                a_execute_agentic_test_cases(
-                    goldens=[golden],
-                    observed_callback=observed_callback,
-                    error_config=error_config,
-                    display_config=display_config,
-                    async_config=async_config,
-                    cache_config=cache_config,
-                    identifier=get_identifier(),
-                    _use_bar_indicator=True,
-                    _is_assert_test=True,
-                )
-            )[0]
-        else:
-            test_result = execute_agentic_test_cases(
-                goldens=[golden],
-                observed_callback=observed_callback,
-                error_config=error_config,
-                display_config=display_config,
-                cache_config=cache_config,
-                identifier=get_identifier(),
-                _use_bar_indicator=False,
-                _is_assert_test=True,
-            )[0]
+    if golden and not test_case:
+        # Trace-scoped assert_test: read the active trace set by the plugin.
+        test_result = _assert_test_from_current_trace(
+            golden=golden,
+            metrics=metrics,
+            error_config=error_config,
+            display_config=display_config,
+        )
 
     elif test_case and metrics:
         if run_async:
@@ -251,21 +223,38 @@ def evaluate(
         end_time = time.perf_counter()
         run_duration = end_time - start_time
         if display_config.print_results:
-            for test_result in test_results:
-                print_test_result(test_result, display_config.display_option)
-            aggregate_metric_pass_rates(test_results)
-        if display_config.file_output_dir is not None:
-            for test_result in test_results:
-                write_test_result_to_file(
-                    test_result,
-                    display_config.display_option,
-                    display_config.file_output_dir,
-                )
+            console_report = EvaluationConsoleReport(test_results)
+            console_report.render_to_terminal(
+                truncate_passing_cases=display_config.truncate_passing_cases
+            )
+
+            # Handle full, un-truncated file exports
+            if display_config.file_output_dir is not None:
+                if display_config.file_type == "html":
+                    console_report.export_to_html(
+                        output_dir=display_config.file_output_dir,
+                        evaluation_name=identifier,
+                        theme_mode="dark",
+                    )
+                elif display_config.file_type == "md":
+                    console_report.export_to_markdown(
+                        output_dir=display_config.file_output_dir,
+                        evaluation_name=identifier,
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid file type: {display_config.file_type}"
+                    )
 
         test_run = global_test_run_manager.get_test_run()
         if hyperparameters is not None or test_run.hyperparameters is None:
             test_run.hyperparameters = process_hyperparameters(hyperparameters)
             test_run.prompts = process_prompts(hyperparameters)
+
+        global_test_run_manager.configure_local_store(
+            results_folder=display_config.results_folder,
+            results_subfolder=display_config.results_subfolder,
+        )
 
         if _skip_reset:
             test_run.run_duration += run_duration
@@ -297,6 +286,15 @@ def evaluate(
             confident_link, test_run_id = res
         else:
             confident_link = test_run_id = None
+
+        # All other side-effects (saving locally, posting to Confident AI,
+        # rendering the table) have already happened inside wrap_up_test_run.
+        # Offer to open the inspect TUI as the very last thing the user sees,
+        # so it never competes with the run output for attention.
+        from deepeval.evaluate.inspect_prompt import maybe_offer_inspect_tui
+
+        maybe_offer_inspect_tui(global_test_run_manager, display_config)
+
         return EvaluationResult(
             test_results=test_results,
             confident_link=confident_link,

@@ -1,5 +1,8 @@
 <p align="center">
-    <img src="https://github.com/confident-ai/deepeval/blob/main/docs/static/img/deepeval.png" alt="DeepEval Logo" width="100%">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/hero/wordmark-dark.svg">
+        <img alt="DeepEval." src="assets/hero/wordmark-light.svg" width="520">
+    </picture>
 </p>
 
 <p align="center">
@@ -22,7 +25,7 @@
         <a href="#-metrics-and-features">Metrics and Features</a> |
         <a href="#-quickstart">Getting Started</a> |
         <a href="#-integrations">Integrations</a> |
-        <a href="https://confident-ai.com?utm_source=GitHub">Confident AI</a>
+        <a href="https://www.confident-ai.com?utm_source=deepeval&utm_medium=github&utm_content=header_nav">Confident AI</a>
     <p>
 </h4>
 
@@ -58,7 +61,7 @@
 Whether you're building AI agents, RAG pipelines, or chatbots, implemented via LangChain or OpenAI, DeepEval has you covered. With it, you can easily determine the optimal models, prompts, and architecture to improve your AI quality, prevent prompt drifting, or even transition from OpenAI to Claude with confidence.
 
 > [!IMPORTANT]
-> Need a place for your DeepEval testing data to live 🏡❤️? [Sign up to the DeepEval platform](https://confident-ai.com?utm_source=GitHub) to compare iterations of your LLM app, generate & share testing reports, and more.
+> Need a place for your DeepEval testing data to live 🏡❤️? [Sign up to the DeepEval platform](https://www.confident-ai.com?utm_source=deepeval&utm_medium=github&utm_content=signup_callout) to compare iterations of your LLM app, generate & share testing reports, and more.
 >
 > ![Demo GIF](assets/demo.gif)
 
@@ -171,7 +174,7 @@ DeepEval plugs into any LLM framework — OpenAI Agents, LangChain, CrewAI, and 
 
 ## ☁️ Platform + Ecosystem
 
-[Confident AI](https://confident-ai.com?utm_source=GitHub) is an all-in-one platform that integrates natively with DeepEval.
+[Confident AI](https://www.confident-ai.com?utm_source=deepeval&utm_medium=github&utm_content=platform_section) is an all-in-one platform that integrates natively with DeepEval.
 
 - Manage datasets, trace LLM applications, run evaluations, and monitor responses in production — all from one platform.
 - Don't need a UI? Confident AI can also be your data persistant layer - run evals, pull datasets, and inspect traces straight from claude code, cursor, via Confident AI's [MCP server](https://github.com/confident-ai/confident-mcp-server).
@@ -182,7 +185,15 @@ DeepEval plugs into any LLM framework — OpenAI Agents, LangChain, CrewAI, and 
 
 <br />
 
-# 🚀 QuickStart
+# 🤖 Vibe-Coder QuickStart
+
+Want your coding agent to add evals and fix failures for you? Install the DeepEval skill, point it at your agent, RAG pipeline, or chatbot, and ask it to generate a dataset, write the eval suite, run `deepeval test run`, and iterate on the failing metrics.
+
+[Start with the 5-minute vibe-coder guide](https://deepeval.com/docs/vibe-coder-quickstart?utm_source=GitHub).
+
+<br />
+
+# 🚀 Human QuickStart
 
 Let's pretend your LLM application is a RAG based customer support chatbot; here's how DeepEval can help test what you've built.
 
@@ -220,13 +231,13 @@ Open `test_chatbot.py` and write your first test case to run an **end-to-end** e
 import pytest
 from deepeval import assert_test
 from deepeval.metrics import GEval
-from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+from deepeval.test_case import LLMTestCase, SingleTurnParams
 
 def test_case():
     correctness_metric = GEval(
         name="Correctness",
         criteria="Determine if the 'actual output' is correct based on the 'expected output'.",
-        evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
+        evaluation_params=[SingleTurnParams.ACTUAL_OUTPUT, SingleTurnParams.EXPECTED_OUTPUT],
         threshold=0.5
     )
     test_case = LLMTestCase(
@@ -262,35 +273,224 @@ deepeval test run test_chatbot.py
 
 <br />
 
-## Evaluating Nested Components
+## Evals With Full Traceability
 
-Use the `@observe` decorator to trace components (LLM calls, retrievers, tool calls, agents) and apply metrics at the component level — no need to rewrite your codebase:
+Use `evals_iterator()` to run the same dataset through your app, whether you instrument it manually or through one of DeepEval's framework integrations.
+
+Here's an example of manual instrumentation:
 
 ```python
 from deepeval.tracing import observe, update_current_span
-from deepeval.test_case import LLMTestCase, LLMTestCaseParams
-from deepeval.dataset import EvaluationDataset, Golden
-from deepeval.metrics import GEval
-
-correctness = GEval(
-    name="Correctness",
-    criteria="Determine if the 'actual output' is correct based on the 'expected output'.",
-    evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-)
-
-@observe(metrics=[correctness])
-def inner_component():
-    update_current_span(test_case=LLMTestCase(input="...", actual_output="..."))
-    return "result"
+from deepeval.test_case import LLMTestCase
+from deepeval.metrics import TaskCompletionMetric
 
 @observe()
-def llm_app(input: str):
-    return inner_component()
+def inner_component(input: str):
+    output = "result"
+    update_current_span(test_case=LLMTestCase(input=input, actual_output=output))
+    return output
 
-dataset = EvaluationDataset(goldens=[Golden(input="Hi!")])
-for golden in dataset.evals_iterator():
-    llm_app(golden.input)
+@observe()
+def app(input: str):
+    return inner_component(input)
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    app(golden.input)
 ```
+
+<details>
+<summary><b>OpenAI</b></summary>
+
+```python
+from deepeval.openai import OpenAI
+from deepeval.tracing import trace
+from deepeval.metrics import TaskCompletionMetric
+
+client = OpenAI()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator():
+    with trace(metrics=[TaskCompletionMetric()]):
+        client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": golden.input}],
+        )
+```
+
+</details>
+
+<details>
+<summary><b>OpenAI Agents</b></summary>
+
+```python
+from agents import Runner
+from deepeval.metrics import TaskCompletionMetric
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    Runner.run_sync(agent, golden.input)
+```
+
+</details>
+
+<details>
+<summary><b>Anthropic</b></summary>
+
+```python
+from deepeval.anthropic import Anthropic
+from deepeval.tracing import trace
+from deepeval.metrics import TaskCompletionMetric
+
+client = Anthropic()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator():
+    with trace(metrics=[TaskCompletionMetric()]):
+        client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": golden.input}],
+        )
+```
+
+</details>
+
+<details>
+<summary><b>LangChain</b></summary>
+
+```python
+from deepeval.integrations.langchain import CallbackHandler
+from deepeval.metrics import TaskCompletionMetric
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator():
+    llm.invoke(
+        golden.input,
+        config={"callbacks": [CallbackHandler(metrics=[TaskCompletionMetric()])]},
+    )
+```
+
+</details>
+
+<details>
+<summary><b>LangGraph</b></summary>
+
+```python
+from deepeval.integrations.langchain import CallbackHandler
+from deepeval.metrics import TaskCompletionMetric
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator():
+    agent.invoke(
+        {"messages": [{"role": "user", "content": golden.input}]},
+        config={"callbacks": [CallbackHandler(metrics=[TaskCompletionMetric()])]},
+    )
+```
+
+</details>
+
+<details>
+<summary><b>Pydantic AI</b></summary>
+
+```python
+from deepeval.metrics import TaskCompletionMetric
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    agent.run_sync(golden.input)
+```
+
+</details>
+
+<details>
+<summary><b>CrewAI</b></summary>
+
+```python
+from deepeval.integrations.crewai import instrument_crewai
+from deepeval.metrics import TaskCompletionMetric
+
+instrument_crewai()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    crew.kickoff({"input": golden.input})
+```
+
+</details>
+
+<details>
+<summary><b>AWS AgentCore</b></summary>
+
+```python
+from deepeval.integrations.agentcore import instrument_agentcore
+from deepeval.metrics import TaskCompletionMetric
+
+instrument_agentcore()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    invoke({"prompt": golden.input})
+```
+
+</details>
+
+<details>
+<summary><b>LlamaIndex</b></summary>
+
+```python
+import asyncio
+from deepeval.evaluate.configs import AsyncConfig
+from deepeval.metrics import TaskCompletionMetric
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(
+    async_config=AsyncConfig(run_async=True),
+    metrics=[TaskCompletionMetric()],
+):
+    task = asyncio.create_task(agent.run(golden.input))
+    dataset.evaluate(task)
+```
+
+</details>
+
+<details>
+<summary><b>Google ADK</b></summary>
+
+```python
+import asyncio
+from deepeval.evaluate.configs import AsyncConfig
+from deepeval.integrations.google_adk import instrument_google_adk
+from deepeval.metrics import TaskCompletionMetric
+
+instrument_google_adk()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(
+    async_config=AsyncConfig(run_async=True),
+    metrics=[TaskCompletionMetric()],
+):
+    task = asyncio.create_task(run_agent(golden.input))
+    dataset.evaluate(task)
+```
+
+</details>
+
+<details>
+<summary><b>Strands</b></summary>
+
+```python
+from deepeval.integrations.strands import instrument_strands
+from deepeval.metrics import TaskCompletionMetric
+
+instrument_strands()
+
+# This metric will be run on your trace end to end.
+for golden in dataset.evals_iterator(metrics=[TaskCompletionMetric()]):
+    agent(golden.input)
+```
+
+</details>
 
 Learn more about component-level evaluations [here.](https://www.deepeval.com/docs/evaluation-component-level-llm-evals)
 
@@ -339,51 +539,6 @@ print(answer_relevancy_metric.reason)
 
 Note that some metrics are for RAG pipelines, while others are for fine-tuning. Make sure to use our docs to pick the right one for your use case.
 
-## Evaluating a Dataset / Test Cases in Bulk
-
-In DeepEval, a dataset is simply a collection of test cases. Here is how you can evaluate these in bulk:
-
-```python
-import pytest
-from deepeval import assert_test
-from deepeval.dataset import EvaluationDataset, Golden
-from deepeval.metrics import AnswerRelevancyMetric
-from deepeval.test_case import LLMTestCase
-
-dataset = EvaluationDataset(goldens=[Golden(input="What's the weather like today?")])
-
-for golden in dataset.goldens:
-    test_case = LLMTestCase(
-        input=golden.input,
-        actual_output=your_llm_app(golden.input)
-    )
-    dataset.add_test_case(test_case)
-
-@pytest.mark.parametrize(
-    "test_case",
-    dataset.test_cases,
-)
-def test_customer_chatbot(test_case: LLMTestCase):
-    answer_relevancy_metric = AnswerRelevancyMetric(threshold=0.5)
-    assert_test(test_case, [answer_relevancy_metric])
-```
-
-```bash
-# Run this in the CLI, you can also add an optional -n flag to run tests in parallel
-deepeval test run test_<filename>.py -n 4
-```
-
-<br/>
-
-Alternatively, although we recommend using `deepeval test run`, you can evaluate a dataset/test cases without using our Pytest integration:
-
-```python
-from deepeval import evaluate
-...
-
-evaluate(dataset, [answer_relevancy_metric])
-```
-
 ## A Note on Env Variables (.env / .env.local)
 
 DeepEval auto-loads `.env.local` then `.env` from the current working directory **at import time**.
@@ -397,7 +552,7 @@ cp .env.example .env.local
 
 # DeepEval With Confident AI
 
-[Confident AI](https://confident-ai.com?utm_source=GitHub) is an all-in-one platform to manage datasets, trace LLM applications, and run evaluations in production. Log in from the CLI to get started:
+[Confident AI](https://www.confident-ai.com?utm_source=deepeval&utm_medium=github&utm_content=cli_login_section) is an all-in-one platform to manage datasets, trace LLM applications, and run evaluations in production. Log in from the CLI to get started:
 
 ```bash
 deepeval login
@@ -417,7 +572,7 @@ Prefer to stay in your IDE? Use DeepEval via [Confident AI's MCP server](https:/
   <img src="assets/confident-mcp-architecture.png" alt="Confident AI MCP Architecture" width="500">
 </p>
 
-Everything on Confident AI is available [here](https://www.confident-ai.com/docs?utm_source=GitHub).
+Everything on Confident AI is available [here](https://www.confident-ai.com/docs?utm_source=deepeval&utm_medium=github&utm_content=cloud_docs).
 
 <br />
 

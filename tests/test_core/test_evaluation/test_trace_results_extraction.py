@@ -9,10 +9,13 @@ from tests.test_core.stubs import make_span_api_like
 from tests.test_core.helpers import ts_iso8601_utc
 
 exec_mod = import_module("deepeval.evaluate.execute")
+_agentic_mod = import_module("deepeval.evaluate.execute.agentic")
 
 
 @pytest.mark.asyncio
-async def test_trace_metric_produces_additional_test_result(monkeypatch):
+async def test_trace_metric_does_not_produce_additional_test_result(
+    monkeypatch,
+):
     monkeypatch.setattr(
         exec_mod.trace_manager,
         "_convert_span_to_api_span",
@@ -62,9 +65,13 @@ async def test_trace_metric_produces_additional_test_result(monkeypatch):
         endTime=ts_iso8601_utc(now),
     )
 
-    # Monkeypatch create_api_trace to return our injected object
+    # Monkeypatch create_api_trace in the agentic submodule where
+    # `_a_execute_agentic_test_case` looks it up.
     monkeypatch.setattr(
-        exec_mod, "create_api_trace", lambda *a, **k: trace_api, raising=True
+        _agentic_mod,
+        "create_api_trace",
+        lambda *a, **k: trace_api,
+        raising=True,
     )
 
     # execute just enough to append results
@@ -103,14 +110,12 @@ async def test_trace_metric_produces_additional_test_result(monkeypatch):
         _use_bar_indicator=False,
         _is_assert_test=False,
         trace=trace,
-        observed_callback=None,
         trace_metrics=[],
         progress=None,
         pbar_id=None,
     )
-    # We should have one top level case result and one extracted trace result
-    assert len(results) == 2
-    assert any(
-        any(md.name == "trace-metric" for md in r.metrics_data or [])
-        for r in results
+    # We should have one top level case result and no extracted trace result
+    assert len(results) == 1
+    assert not any(
+        md.name == "trace-metric" for md in results[0].metrics_data or []
     )

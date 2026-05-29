@@ -7,7 +7,12 @@ from uuid import UUID
 from time import perf_counter
 from contextlib import contextmanager
 
-from deepeval.tracing.context import current_trace_context, current_span_context
+from deepeval.tracing.context import (
+    apply_pending_to_span,
+    current_span_context,
+    current_trace_context,
+    pop_pending_for,
+)
 from deepeval.test_case.llm_test_case import ToolCall
 from deepeval.tracing.types import (
     LlmOutput,
@@ -23,6 +28,7 @@ from deepeval.tracing.types import (
     ToolSpan,
 )
 from deepeval.telemetry import capture_tracing_integration
+from deepeval.tracing.integrations import Integration
 
 # Debug logging for LangChain callbacks (enable with DEEPEVAL_DEBUG_LANGCHAIN_CALLBACKS=1)
 _DEBUG_CALLBACKS = os.environ.get(
@@ -49,6 +55,7 @@ try:
         convert_chat_messages_to_input,
         extract_name,
         safe_extract_model_name,
+        safe_extract_provider,
         safe_extract_token_usage,
         enter_current_context,
         exit_current_context,
@@ -85,6 +92,7 @@ class CallbackHandler(BaseCallbackHandler):
         metrics: Optional[List[BaseMetric]] = None,
         metric_collection: Optional[str] = None,
         test_case_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ):
         is_langchain_installed()
         with capture_tracing_integration("langchain.callback.CallbackHandler"):
@@ -110,6 +118,7 @@ class CallbackHandler(BaseCallbackHandler):
                 "thread_id": thread_id,
                 "user_id": user_id,
                 "test_case_id": test_case_id,
+                "turn_id": turn_id,
             }
             self._trace_init_fields: Dict[str, Any] = dict(
                 self._original_init_fields
@@ -204,6 +213,8 @@ class CallbackHandler(BaseCallbackHandler):
                 trace.user_id = fields["user_id"]
             if fields.get("test_case_id") is not None:
                 trace.test_case_id = fields["test_case_id"]
+            if fields.get("turn_id") is not None:
+                trace.turn_id = fields["turn_id"]
             # prevent re-applying on every callback
             self._trace_init_fields = {}
 
@@ -291,6 +302,7 @@ class CallbackHandler(BaseCallbackHandler):
                 span_type="custom",
                 func_name=extract_name(serialized, **kwargs),
             )
+            base_span.integration = Integration.LANGCHAIN.value
             # Register this run_id -> span mapping for child callbacks
             self._run_id_to_span_uuid[str(run_id)] = uuid_str
 
@@ -376,6 +388,8 @@ class CallbackHandler(BaseCallbackHandler):
 
             llm_span.input = input_messages
             llm_span.model = model
+            llm_span.provider = safe_extract_provider(md, **kwargs)
+            llm_span.integration = Integration.LANGCHAIN.value
 
             # Extract metrics and prompt from metadata if provided, but don't mutate original
             llm_span.metrics = md.get("metrics")
@@ -386,6 +400,16 @@ class CallbackHandler(BaseCallbackHandler):
             llm_span.prompt_commit_hash = prompt.hash if prompt else None
             llm_span.prompt_label = prompt.label if prompt else None
             llm_span.prompt_version = prompt.version if prompt else None
+
+            # Drain any next_llm_span(...) / next_span(...) defaults the
+            # user staged in surrounding scope. Applied AFTER the metadata
+            # path above so that staged fields override the static
+            # `with_config(metadata={...})` baseline ("more specific
+            # wins"); fields absent from the pending payload are left
+            # alone.
+            pending = pop_pending_for("llm")
+            if pending:
+                apply_pending_to_span(llm_span, pending)
 
     def on_llm_start(
         self,
@@ -428,6 +452,8 @@ class CallbackHandler(BaseCallbackHandler):
 
             llm_span.input = input_messages
             llm_span.model = model
+            llm_span.provider = safe_extract_provider(md, **kwargs)
+            llm_span.integration = Integration.LANGCHAIN.value
 
             # Extract metrics and prompt from metadata if provided, but don't mutate original
             llm_span.metrics = md.get("metrics")
@@ -438,6 +464,12 @@ class CallbackHandler(BaseCallbackHandler):
             llm_span.prompt_commit_hash = prompt.hash if prompt else None
             llm_span.prompt_label = prompt.label if prompt else None
             llm_span.prompt_version = prompt.version if prompt else None
+
+            # See on_chat_model_start: drain pending next_llm_span(...)
+            # defaults so users can stage metrics dynamically per call.
+            pending = pop_pending_for("llm")
+            if pending:
+                apply_pending_to_span(llm_span, pending)
 
     def on_llm_end(
         self,
@@ -468,6 +500,7 @@ class CallbackHandler(BaseCallbackHandler):
             total_input_tokens = 0
             total_output_tokens = 0
             model = None
+            provider = None
 
             for generation in response.generations:
                 for gen in generation:
@@ -478,6 +511,9 @@ class CallbackHandler(BaseCallbackHandler):
                             # extract model name from response_metadata
                             model = gen.message.response_metadata.get(
                                 "model_name"
+                            )
+                            provider = gen.message.response_metadata.get(
+                                "model_provider"
                             )
 
                             # extract input and output token
@@ -505,6 +541,7 @@ class CallbackHandler(BaseCallbackHandler):
                             )
 
             llm_span.model = model if model else llm_span.model
+            llm_span.provider = provider if provider else llm_span.provider
             llm_span.output = output
             llm_span.input_token_count = (
                 total_input_tokens if total_input_tokens > 0 else None
@@ -548,6 +585,7 @@ class CallbackHandler(BaseCallbackHandler):
             total_input_tokens = 0
             total_output_tokens = 0
             model = None
+            provider = None
 
             # Handle LLMResult (same as on_llm_end)
             if isinstance(response, LLMResult):
@@ -559,6 +597,9 @@ class CallbackHandler(BaseCallbackHandler):
                             ):
                                 model = gen.message.response_metadata.get(
                                     "model_name"
+                                )
+                                provider = gen.message.response_metadata.get(
+                                    "model_provider"
                                 )
                                 input_tokens, output_tokens = (
                                     safe_extract_token_usage(gen.message)
@@ -584,6 +625,7 @@ class CallbackHandler(BaseCallbackHandler):
                                 )
 
             llm_span.model = model if model else llm_span.model
+            llm_span.provider = provider if provider else llm_span.provider
             llm_span.output = output
             llm_span.input_token_count = (
                 total_input_tokens if total_input_tokens > 0 else None
@@ -702,9 +744,16 @@ class CallbackHandler(BaseCallbackHandler):
                     serialized, **kwargs
                 ),  # ignored when setting the input
             )
+            tool_span.integration = Integration.LANGCHAIN.value
             # Register this run_id -> span mapping for child callbacks
             self._run_id_to_span_uuid[str(run_id)] = uuid_str
             tool_span.input = inputs
+
+            # Drain any next_tool_span(...) / next_span(...) defaults so
+            # users can stage tool-span metrics or test cases per call.
+            pending = pop_pending_for("tool")
+            if pending:
+                apply_pending_to_span(tool_span, pending)
 
     def on_tool_end(
         self,
@@ -794,12 +843,19 @@ class CallbackHandler(BaseCallbackHandler):
                     "embedder": md.get("ls_embedding_provider", "unknown"),
                 },
             )
+            retriever_span.integration = Integration.LANGCHAIN.value
             # Register this run_id -> span mapping for child callbacks
             self._run_id_to_span_uuid[str(run_id)] = uuid_str
             retriever_span.input = query
 
             # Extract metric_collection from metadata if provided
             retriever_span.metric_collection = md.get("metric_collection")
+
+            # Drain any next_retriever_span(...) / next_span(...) defaults
+            # so users can stage retriever metrics or test cases per call.
+            pending = pop_pending_for("retriever")
+            if pending:
+                apply_pending_to_span(retriever_span, pending)
 
     def on_retriever_end(
         self,

@@ -13,7 +13,8 @@ from deepeval.metrics.utils import (
 )
 from deepeval.test_case import (
     LLMTestCase,
-    LLMTestCaseParams,
+    SingleTurnParams,
+    RetrievedContextData,
 )
 from deepeval.metrics import BaseMetric
 from deepeval.models import DeepEvalBaseLLM
@@ -22,14 +23,13 @@ from deepeval.metrics.contextual_precision.template import (
 )
 from deepeval.metrics.indicator import metric_progress_indicator
 import deepeval.metrics.contextual_precision.schema as cpschema
-from deepeval.metrics.api import metric_data_manager
 
 
 class ContextualPrecisionMetric(BaseMetric):
-    _required_params: List[LLMTestCaseParams] = [
-        LLMTestCaseParams.INPUT,
-        LLMTestCaseParams.RETRIEVAL_CONTEXT,
-        LLMTestCaseParams.EXPECTED_OUTPUT,
+    _required_params: List[SingleTurnParams] = [
+        SingleTurnParams.INPUT,
+        SingleTurnParams.RETRIEVAL_CONTEXT,
+        SingleTurnParams.EXPECTED_OUTPUT,
     ]
 
     def __init__(
@@ -90,13 +90,15 @@ class ContextualPrecisionMetric(BaseMetric):
             else:
                 input = test_case.input
                 expected_output = test_case.expected_output
-                retrieval_context = test_case.retrieval_context
+                grouped_retrieval_context = self._group_retrieval_contexts(
+                    test_case.retrieval_context
+                )
 
                 self.verdicts: List[cpschema.ContextualPrecisionVerdict] = (
                     self._generate_verdicts(
                         input,
                         expected_output,
-                        retrieval_context,
+                        grouped_retrieval_context,
                         multimodal,
                     )
                 )
@@ -110,10 +112,6 @@ class ContextualPrecisionMetric(BaseMetric):
                         f"Score: {self.score}\nReason: {self.reason}",
                     ],
                 )
-                if _log_metric_to_confident:
-                    metric_data_manager.post_metric_if_enabled(
-                        self, test_case=test_case
-                    )
             return self.score
 
     async def a_measure(
@@ -145,11 +143,16 @@ class ContextualPrecisionMetric(BaseMetric):
         ):
             input = test_case.input
             expected_output = test_case.expected_output
-            retrieval_context = test_case.retrieval_context
+            grouped_retrieval_context = self._group_retrieval_contexts(
+                test_case.retrieval_context
+            )
 
             self.verdicts: List[cpschema.ContextualPrecisionVerdict] = (
                 await self._a_generate_verdicts(
-                    input, expected_output, retrieval_context, multimodal
+                    input,
+                    expected_output,
+                    grouped_retrieval_context,
+                    multimodal,
                 )
             )
             self.score = self._calculate_score()
@@ -162,10 +165,6 @@ class ContextualPrecisionMetric(BaseMetric):
                     f"Score: {self.score}\nReason: {self.reason}",
                 ],
             )
-            if _log_metric_to_confident:
-                metric_data_manager.post_metric_if_enabled(
-                    self, test_case=test_case
-                )
             return self.score
 
     async def _a_generate_reason(self, input: str, multimodal: bool):
@@ -263,6 +262,39 @@ class ContextualPrecisionMetric(BaseMetric):
                 for item in data["verdicts"]
             ],
         )
+
+    def _group_retrieval_contexts(
+        self, retrieval_contexts: List[Union[str, RetrievedContextData]]
+    ) -> List[str]:
+        grouped_contexts_dict = {}
+        ordered_identifiers = []
+
+        for context in retrieval_contexts:
+            if isinstance(context, RetrievedContextData):
+                if context.source not in grouped_contexts_dict:
+                    ordered_identifiers.append(
+                        {"type": "grouped", "key": context.source}
+                    )
+                    grouped_contexts_dict[context.source] = []
+                grouped_contexts_dict[context.source].append(context.context)
+            else:
+                ordered_identifiers.append(
+                    {"type": "standalone", "value": context}
+                )
+
+        processed_contexts = []
+        for item in ordered_identifiers:
+            if item["type"] == "grouped":
+                source = item["key"]
+                contents = grouped_contexts_dict[source]
+                combined_content = f"Source: {source}\n" + "\n---\n".join(
+                    contents
+                )
+                processed_contexts.append(combined_content)
+            else:
+                processed_contexts.append(item["value"])
+
+        return processed_contexts
 
     def _calculate_score(self):
         number_of_verdicts = len(self.verdicts)

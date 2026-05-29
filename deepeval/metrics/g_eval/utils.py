@@ -4,8 +4,8 @@ import math
 
 from deepeval.models import DeepEvalBaseLLM, GPTModel, AzureOpenAIModel
 from deepeval.test_case import (
-    LLMTestCaseParams,
-    TurnParams,
+    SingleTurnParams,
+    MultiTurnParams,
     LLMTestCase,
     ToolCall,
 )
@@ -13,6 +13,23 @@ from pydantic import BaseModel, field_validator
 from deepeval.models.llms.constants import OPENAI_MODELS_DATA
 
 from deepeval.test_case.conversational_test_case import ConversationalTestCase
+
+
+from pydantic import BaseModel, Field
+from typing import Optional, List, Tuple
+
+
+class APIRubric(BaseModel):
+    scoreRange: Tuple[float, float]
+    expectedOutcome: str
+
+
+class MetricPullResponse(BaseModel):
+    id: Optional[str] = None
+    criteria: Optional[str] = None
+    evaluationSteps: Optional[List[str]] = None
+    requiredParameters: List[str] = Field(default_factory=list)
+    rubric: Optional[List[APIRubric]] = None
 
 
 class Rubric(BaseModel):
@@ -34,47 +51,84 @@ class Rubric(BaseModel):
 
 
 G_EVAL_PARAMS = {
-    LLMTestCaseParams.INPUT: "Input",
-    LLMTestCaseParams.ACTUAL_OUTPUT: "Actual Output",
-    LLMTestCaseParams.EXPECTED_OUTPUT: "Expected Output",
-    LLMTestCaseParams.CONTEXT: "Context",
-    LLMTestCaseParams.RETRIEVAL_CONTEXT: "Retrieval Context",
-    LLMTestCaseParams.EXPECTED_TOOLS: "Expected Tools",
-    LLMTestCaseParams.TOOLS_CALLED: "Tools Called",
+    SingleTurnParams.INPUT: "Input",
+    SingleTurnParams.ACTUAL_OUTPUT: "Actual Output",
+    SingleTurnParams.EXPECTED_OUTPUT: "Expected Output",
+    SingleTurnParams.CONTEXT: "Context",
+    SingleTurnParams.RETRIEVAL_CONTEXT: "Retrieval Context",
+    SingleTurnParams.METADATA: "Metadata",
+    SingleTurnParams.TAGS: "Tags",
+    SingleTurnParams.EXPECTED_TOOLS: "Expected Tools",
+    SingleTurnParams.TOOLS_CALLED: "Tools Called",
 }
 
 CONVERSATIONAL_G_EVAL_PARAMS = {
-    TurnParams.CONTENT: "Content",
-    TurnParams.ROLE: "Role",
-    TurnParams.TOOLS_CALLED: "Tools Called",
-    TurnParams.RETRIEVAL_CONTEXT: "Retrieval Context",
-    TurnParams.EXPECTED_OUTCOME: "Expected Outcome",
-    TurnParams.SCENARIO: "Scenario",
+    MultiTurnParams.CONTENT: "Content",
+    MultiTurnParams.ROLE: "Role",
+    MultiTurnParams.METADATA: "Metadata",
+    MultiTurnParams.TAGS: "Tags",
+    MultiTurnParams.TOOLS_CALLED: "Tools Called",
+    MultiTurnParams.RETRIEVAL_CONTEXT: "Retrieval Context",
+    MultiTurnParams.EXPECTED_OUTCOME: "Expected Outcome",
+    MultiTurnParams.SCENARIO: "Scenario",
 }
 
 G_EVAL_API_PARAMS = {
-    LLMTestCaseParams.INPUT: "input",
-    LLMTestCaseParams.ACTUAL_OUTPUT: "actualOutput",
-    LLMTestCaseParams.EXPECTED_OUTPUT: "expectedOutput",
-    LLMTestCaseParams.CONTEXT: "context",
-    LLMTestCaseParams.RETRIEVAL_CONTEXT: "retrievalContext",
-    LLMTestCaseParams.EXPECTED_TOOLS: "expectedTools",
-    LLMTestCaseParams.TOOLS_CALLED: "toolsCalled",
+    SingleTurnParams.INPUT: "input",
+    SingleTurnParams.ACTUAL_OUTPUT: "actualOutput",
+    SingleTurnParams.EXPECTED_OUTPUT: "expectedOutput",
+    SingleTurnParams.CONTEXT: "context",
+    SingleTurnParams.RETRIEVAL_CONTEXT: "retrievalContext",
+    SingleTurnParams.METADATA: "metadata",
+    SingleTurnParams.TAGS: "tags",
+    SingleTurnParams.EXPECTED_TOOLS: "expectedTools",
+    SingleTurnParams.TOOLS_CALLED: "toolsCalled",
 }
 
 CONVERSATIONAL_G_EVAL_API_PARAMS = {
-    TurnParams.ROLE: "role",
-    TurnParams.CONTENT: "content",
-    TurnParams.SCENARIO: "scenario",
-    TurnParams.EXPECTED_OUTCOME: "expectedOutcome",
-    TurnParams.RETRIEVAL_CONTEXT: "retrievalContext",
-    TurnParams.TOOLS_CALLED: "toolsCalled",
+    MultiTurnParams.ROLE: "role",
+    MultiTurnParams.CONTENT: "content",
+    MultiTurnParams.METADATA: "metadata",
+    MultiTurnParams.TAGS: "tags",
+    MultiTurnParams.SCENARIO: "scenario",
+    MultiTurnParams.EXPECTED_OUTCOME: "expectedOutcome",
+    MultiTurnParams.RETRIEVAL_CONTEXT: "retrievalContext",
+    MultiTurnParams.TOOLS_CALLED: "toolsCalled",
 }
+
+
+def construct_geval_pull_evaluation_params(
+    required_parameters: List[str], multi_turn: bool
+) -> List[Union[SingleTurnParams, MultiTurnParams]]:
+    if not required_parameters:
+        raise ValueError(
+            "This metric has no evaluation parameters and cannot be pulled."
+        )
+
+    if multi_turn:
+        reverse_params = {
+            value: key
+            for key, value in CONVERSATIONAL_G_EVAL_API_PARAMS.items()
+        }
+    else:
+        reverse_params = {
+            value: key for key, value in G_EVAL_API_PARAMS.items()
+        }
+
+    unsupported_params = [
+        param for param in required_parameters if param not in reverse_params
+    ]
+    if unsupported_params:
+        raise ValueError(
+            f"Unsupported evaluation params encountered while pulling metric: {', '.join(unsupported_params)}."
+        )
+
+    return [reverse_params[param] for param in required_parameters]
 
 
 def construct_geval_upload_payload(
     name: str,
-    evaluation_params: List[LLMTestCaseParams],
+    evaluation_params: List[SingleTurnParams],
     g_eval_api_params: Dict,
     criteria: Optional[str] = None,
     evaluation_steps: Optional[List[str]] = None,
@@ -116,6 +170,20 @@ def construct_geval_upload_payload(
         ]
 
     return payload
+
+
+def ensure_required_params(
+    evaluation_params: Optional[List],
+    criteria: Optional[str],
+    evaluation_steps: Optional[List[str]],
+    *,
+    operation: str = "evaluate",
+) -> None:
+    if not evaluation_params:
+        raise ValueError(
+            f"GEval requires evaluation_params. Provide them at initialization or call pull() before {operation}."
+        )
+    validate_criteria_and_evaluation_steps(criteria, evaluation_steps)
 
 
 def validate_criteria_and_evaluation_steps(
@@ -197,7 +265,7 @@ def no_log_prob_support(model: Union[str, DeepEvalBaseLLM]):
 
 
 def construct_g_eval_params_string(
-    llm_test_case_params: List[LLMTestCaseParams],
+    llm_test_case_params: List[SingleTurnParams],
 ):
     g_eval_params = [G_EVAL_PARAMS[param] for param in llm_test_case_params]
     if len(g_eval_params) == 1:
@@ -213,7 +281,7 @@ def construct_g_eval_params_string(
 
 
 def construct_conversational_g_eval_turn_params_string(
-    turn_params: List[TurnParams],
+    turn_params: List[MultiTurnParams],
 ):
     g_eval_params = [
         CONVERSATIONAL_G_EVAL_PARAMS[param] for param in turn_params
@@ -232,25 +300,29 @@ def construct_conversational_g_eval_turn_params_string(
 
 
 def construct_non_turns_test_case_string(
-    turn_params: List[TurnParams], test_case: ConversationalTestCase
+    turn_params: List[MultiTurnParams], test_case: ConversationalTestCase
 ) -> str:
-    text = """"""
+    body = """"""
     for param in turn_params:
         if (
-            param == TurnParams.RETRIEVAL_CONTEXT
-            or param == TurnParams.TOOLS_CALLED
-            or param == TurnParams.CONTENT
-            or param == TurnParams.ROLE
+            param == MultiTurnParams.RETRIEVAL_CONTEXT
+            or param == MultiTurnParams.TOOLS_CALLED
+            or param == MultiTurnParams.CONTENT
+            or param == MultiTurnParams.ROLE
         ):
             continue
 
         value = getattr(test_case, param.value)
-        text += f"{CONVERSATIONAL_G_EVAL_PARAMS[param]}:\n{value} \n\n"
-    return text
+        body += f"{CONVERSATIONAL_G_EVAL_PARAMS[param]}:\n{value} \n\n"
+
+    if not body:
+        return ""
+
+    return f"Conversation-level fields:\n{body}"
 
 
 def construct_test_case_string(
-    evaluation_params: List[LLMTestCaseParams], test_case: LLMTestCase
+    evaluation_params: List[SingleTurnParams], test_case: LLMTestCase
 ) -> str:
     text = """"""
     for param in evaluation_params:

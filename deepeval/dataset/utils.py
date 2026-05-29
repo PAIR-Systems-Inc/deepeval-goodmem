@@ -21,10 +21,17 @@ def convert_test_cases_to_goldens(
             "actual_output": test_case.actual_output,
             "expected_output": test_case.expected_output,
             "context": test_case.context,
-            "retrieval_context": test_case.retrieval_context,
+            "retrieval_context": (
+                [
+                    rc.context if hasattr(rc, "context") else rc
+                    for rc in test_case.retrieval_context
+                ]
+                if test_case.retrieval_context
+                else None
+            ),
             "tools_called": test_case.tools_called,
             "expected_tools": test_case.expected_tools,
-            "additional_metadata": test_case.additional_metadata,
+            "additional_metadata": test_case.metadata,
         }
         goldens.append(Golden(**golden))
     return goldens
@@ -47,7 +54,7 @@ def convert_goldens_to_test_cases(
             expected_tools=golden.expected_tools,
             name=golden.name,
             comments=golden.comments,
-            additional_metadata=golden.additional_metadata,
+            metadata=golden.additional_metadata,
             _dataset_alias=_alias,
             _dataset_id=_id,
             _dataset_rank=index,
@@ -71,7 +78,7 @@ def convert_convo_test_cases_to_convo_goldens(
             "expected_outcome": test_case.expected_outcome,
             "user_description": test_case.user_description,
             "context": test_case.context,
-            "additional_metadata": test_case.additional_metadata,
+            "additional_metadata": test_case.metadata,
         }
         goldens.append(ConversationalGolden(**golden))
     return goldens
@@ -87,10 +94,11 @@ def convert_convo_goldens_to_convo_test_cases(
         test_case = ConversationalTestCase(
             turns=golden.turns or [],
             scenario=golden.scenario,
+            expected_outcome=golden.expected_outcome,
             user_description=golden.user_description,
             context=golden.context,
             name=golden.name,
-            additional_metadata=golden.additional_metadata,
+            metadata=golden.additional_metadata,
             comments=golden.comments,
             _dataset_alias=_alias,
             _dataset_id=_id,
@@ -134,15 +142,18 @@ def format_turns(turns: List[Turn]) -> str:
             "content": turn.content,
             "user_id": turn.user_id if turn.user_id is not None else None,
             "retrieval_context": (
-                turn.retrieval_context if turn.retrieval_context else None
+                [
+                    rc.context if hasattr(rc, "context") else rc
+                    for rc in turn.retrieval_context
+                ]
+                if turn.retrieval_context
+                else None
             ),
             "tools_called": _dump_list(turn.tools_called),
             "mcp_tools_called": _dump_list(turn.mcp_tools_called),
             "mcp_resources_called": _dump_list(turn.mcp_resources_called),
             "mcp_prompts_called": _dump_list(turn.mcp_prompts_called),
-            "additional_metadata": (
-                turn.additional_metadata if turn.additional_metadata else None
-            ),
+            "metadata": turn.metadata if turn.metadata else None,
         }
         res.append(cur_turn)
     try:

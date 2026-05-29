@@ -1,11 +1,10 @@
 from enum import Enum
 import os
 import json
+from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import Any, Optional, List, Dict, Union, Tuple
-import shutil
 import sys
-import datetime
 from rich.table import Table
 from rich.console import Console
 from rich import print
@@ -59,6 +58,8 @@ else:
 
 TEMP_FILE_PATH = f"{HIDDEN_DIR}/.temp_test_run_data.json"
 LATEST_TEST_RUN_FILE_PATH = f"{HIDDEN_DIR}/.latest_test_run.json"
+# Full TestRun payload (same as timestamped exports); overwritten each run.
+LATEST_FULL_TEST_RUN_FILE_PATH = f"{HIDDEN_DIR}/.latest_run_full.json"
 LATEST_TEST_RUN_DATA_KEY = "testRunData"
 LATEST_TEST_RUN_LINK_KEY = "testRunLink"
 console = Console()
@@ -461,12 +462,38 @@ class TestRunManager:
         self.temp_file_path = TEMP_FILE_PATH
         self.save_to_disk = False
         self.disable_request = False
+        self.results_folder: Optional[str] = None
+        self.results_subfolder: Optional[str] = None
+        # Timestamped export if one was written, else rolling snapshot.
+        # Consumed by the post-run inspect prompt.
+        self.last_saved_path: Optional[Path] = None
 
     def reset(self):
         self.test_run = None
         self.temp_file_path = TEMP_FILE_PATH
         self.save_to_disk = False
         self.disable_request = False
+        self.results_folder = None
+        self.results_subfolder = None
+        self.last_saved_path = None
+
+    def configure_local_store(
+        self,
+        results_folder: Optional[str] = None,
+        results_subfolder: Optional[str] = None,
+    ):
+        """Configure where `save_test_run_locally` writes the full TestRun JSON.
+
+        Values set here take precedence over the `DEEPEVAL_RESULTS_FOLDER`
+        env var. Intended to be called from `evaluate()` / `evals_iterator()`
+        right before `wrap_up_test_run()`.
+        """
+        self.results_folder = results_folder
+        self.results_subfolder = results_subfolder
+        # The manager is a long-lived singleton, so a previous run's path
+        # could linger and mislead the inspect prompt into offering a stale
+        # file. Clear it whenever a new run configures its local store.
+        self.last_saved_path = None
 
     def set_test_run(self, test_run: TestRun):
         self.test_run = test_run
@@ -966,24 +993,48 @@ class TestRunManager:
         return link, res.id
 
     def save_test_run_locally(self):
-        local_folder = os.getenv("DEEPEVAL_RESULTS_FOLDER")
-        if local_folder:
-            new_test_filename = datetime.datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
+        """Persist the current TestRun to disk.
+
+        Always writes a rolling snapshot to `.deepeval/.latest_run_full.json`.
+        Additionally writes a timestamped `test_run_<YYYYMMDD_HHMMSS>.json` to
+        `results_folder` (or `DEEPEVAL_RESULTS_FOLDER`) when set.
+        """
+        if self.test_run is None:
+            return
+
+        from deepeval.evaluate.local_store import (
+            resolve_target_dir,
+            write_rolling_test_run,
+            write_test_run,
+        )
+
+        rolling_path = write_rolling_test_run(self.test_run)
+        if rolling_path is not None:
+            self.last_saved_path = rolling_path
+
+        target_dir = resolve_target_dir(
+            results_folder=self.results_folder,
+            results_subfolder=self.results_subfolder,
+        )
+        if target_dir is None:
+            return
+
+        if target_dir.exists() and target_dir.is_file():
+            print(
+                f"❌ Error: results_folder={target_dir} already exists and is a file.\n"
+                "Detailed results won't be saved. Please specify a folder or an available path."
             )
-            os.rename(self.temp_file_path, new_test_filename)
-            if not os.path.exists(local_folder):
-                os.mkdir(local_folder)
-                shutil.copy(new_test_filename, local_folder)
-                print(f"Results saved in {local_folder} as {new_test_filename}")
-            elif os.path.isfile(local_folder):
-                print(
-                    f"""❌ Error: DEEPEVAL_RESULTS_FOLDER={local_folder} already exists and is a file.\nDetailed results won't be saved. Please specify a folder or an available path."""
-                )
-            else:
-                shutil.copy(new_test_filename, local_folder)
-                print(f"Results saved in {local_folder} as {new_test_filename}")
-            os.remove(new_test_filename)
+            return
+
+        try:
+            path = write_test_run(target_dir, self.test_run)
+            self.last_saved_path = path
+            print(f"Test run saved at {path}")
+        except Exception as e:
+            print(
+                f"Warning: failed to save test run to {target_dir}: {e}",
+                file=sys.stderr,
+            )
 
     def wrap_up_test_run(
         self,
@@ -1004,14 +1055,18 @@ class TestRunManager:
             delete_file_if_exists(self.temp_file_path)
             return
 
+        # Don't block the post when all metrics errored — the spans still
+        # carry the underlying error info (populated by ``Observer.__exit__``)
+        # which the dashboard can render. Just warn so it's not mistaken
+        # for a successful run.
         valid_scores = test_run.construct_metrics_scores()
         if valid_scores == 0:
-            print("All metrics errored for all test cases, please try again.")
-            delete_file_if_exists(self.temp_file_path)
-            delete_file_if_exists(
-                global_test_run_cache_manager.temp_cache_file_name
+            console.print(
+                "\n[bold yellow]⚠ WARNING:[/bold yellow] All metrics errored "
+                "across every test case — no metric scores were recorded. "
+                "Posting the run anyway so you can inspect the trace + span "
+                "errors on the Confident AI dashboard.\n"
             )
-            return
         test_run.run_duration = runDuration
         test_run.calculate_test_passes_and_fails()
         test_run.sort_test_cases()
@@ -1044,7 +1099,8 @@ class TestRunManager:
 
         self.save_test_run_locally()
         delete_file_if_exists(self.temp_file_path)
-        if is_confident() and self.disable_request is False:
+        confident_enabled = is_confident()
+        if confident_enabled and self.disable_request is False:
             return self.post_test_run(test_run)
         else:
             self.save_test_run(

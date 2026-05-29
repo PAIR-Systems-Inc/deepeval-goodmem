@@ -4,8 +4,9 @@ from pydantic import (
     model_validator,
     PrivateAttr,
     AliasChoices,
+    model_serializer,
 )
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from enum import Enum
 import json
 import uuid
@@ -14,6 +15,7 @@ import os
 import mimetypes
 import base64
 import weakref
+import warnings
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, unquote
 from deepeval.utils import make_model_config
@@ -26,9 +28,7 @@ from deepeval.test_case.mcp import (
     validate_mcp_servers,
 )
 
-_MLLM_IMAGE_REGISTRY: weakref.WeakValueDictionary[str, "MLLMImage"] = (
-    weakref.WeakValueDictionary()
-)
+_MLLM_IMAGE_REGISTRY: Dict[str, "MLLMImage"] = {}
 
 
 @dataclass
@@ -74,8 +74,10 @@ class MLLMImage:
                     raise ValueError(
                         f"Invalid remote URL format: {self.url}. URL must start with http:// or https://"
                     )
-                self.filename = None
-                self.mimeType = None
+
+                parsed_url = urlparse(self.url)
+                self.filename = os.path.basename(parsed_url.path)
+                self.mimeType = mimetypes.guess_type(self.filename)[0]
                 self.dataBase64 = None
 
         _MLLM_IMAGE_REGISTRY[self._id] = self
@@ -92,6 +94,8 @@ class MLLMImage:
         return self
 
     def _placeholder(self) -> str:
+        if self.mimeType == "application/pdf":
+            return f"[DEEPEVAL:PDF:{self._id}]"
         return f"[DEEPEVAL:IMAGE:{self._id}]"
 
     def __str__(self) -> str:
@@ -134,7 +138,7 @@ class MLLMImage:
         return False
 
     def parse_multimodal_string(s: str):
-        pattern = r"\[DEEPEVAL:IMAGE:(.*?)\]"
+        pattern = r"\[DEEPEVAL:(?:IMAGE|PDF):(.*?)\]"
         matches = list(re.finditer(pattern, s))
 
         result = []
@@ -148,10 +152,11 @@ class MLLMImage:
 
             img_id = m.group(1)
 
-            if img_id not in _MLLM_IMAGE_REGISTRY:
-                MLLMImage(url=img_id, _id=img_id)
+            img = _MLLM_IMAGE_REGISTRY.get(img_id)
+            if img is None:
+                img = MLLMImage(url=img_id, _id=img_id)
 
-            result.append(_MLLM_IMAGE_REGISTRY[img_id])
+            result.append(img)
             last_end = end
 
         if last_end < len(s):
@@ -166,18 +171,32 @@ class MLLMImage:
         return f"data:{self.mimeType};base64,{self.dataBase64}"
 
 
-class LLMTestCaseParams(Enum):
+class SingleTurnParams(Enum):
     INPUT = "input"
     ACTUAL_OUTPUT = "actual_output"
     EXPECTED_OUTPUT = "expected_output"
     CONTEXT = "context"
     RETRIEVAL_CONTEXT = "retrieval_context"
+    METADATA = "metadata"
+    TAGS = "tags"
     TOOLS_CALLED = "tools_called"
     EXPECTED_TOOLS = "expected_tools"
     MCP_SERVERS = "mcp_servers"
     MCP_TOOLS_CALLED = "mcp_tools_called"
     MCP_RESOURCES_CALLED = "mcp_resources_called"
     MCP_PROMPTS_CALLED = "mcp_prompts_called"
+
+
+def __getattr__(name: str):
+    if name == "LLMTestCaseParams":
+        warnings.warn(
+            "'LLMTestCaseParams' is deprecated and will be removed in a future "
+            "release. Use 'SingleTurnParams' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return SingleTurnParams
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ToolCallParams(Enum):
@@ -301,6 +320,15 @@ class ToolCall(BaseModel):
         )
 
 
+class RetrievedContextData(BaseModel):
+    context: str
+    source: str
+
+    @model_serializer
+    def serialize_model(self) -> str:
+        return f"{self.source}: {self.context}"
+
+
 class LLMTestCase(BaseModel):
     model_config = make_model_config(extra="ignore")
 
@@ -318,16 +346,15 @@ class LLMTestCase(BaseModel):
     context: Optional[List[str]] = Field(
         default=None, serialization_alias="context"
     )
-    retrieval_context: Optional[List[str]] = Field(
+    retrieval_context: Optional[List[Union[str, RetrievedContextData]]] = Field(
         default=None,
         serialization_alias="retrievalContext",
         validation_alias=AliasChoices("retrievalContext", "retrieval_context"),
     )
-    additional_metadata: Optional[Dict] = Field(
+    metadata: Optional[Dict] = Field(
         default=None,
-        serialization_alias="additionalMetadata",
         validation_alias=AliasChoices(
-            "additionalMetadata", "additional_metadata"
+            "metadata", "additionalMetadata", "additional_metadata"
         ),
     )
     tools_called: Optional[List[ToolCall]] = Field(
@@ -382,6 +409,24 @@ class LLMTestCase(BaseModel):
         default_factory=lambda: str(uuid.uuid4())
     )
 
+    @property
+    def additional_metadata(self) -> Optional[Dict]:
+        warnings.warn(
+            "'additional_metadata' is deprecated. Use 'metadata' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.metadata
+
+    @additional_metadata.setter
+    def additional_metadata(self, value: Optional[Dict]):
+        warnings.warn(
+            "'additional_metadata' is deprecated. Use 'metadata' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.metadata = value
+
     @model_validator(mode="after")
     def set_is_multimodal(self):
         import re
@@ -389,7 +434,7 @@ class LLMTestCase(BaseModel):
         if self.multimodal is True:
             return self
 
-        pattern = r"\[DEEPEVAL:IMAGE:(.*?)\]"
+        pattern = r"\[DEEPEVAL:(?:IMAGE|PDF):(.*?)\]"
 
         auto_detect = (
             any(
@@ -404,8 +449,12 @@ class LLMTestCase(BaseModel):
         )
         if self.retrieval_context is not None:
             auto_detect = auto_detect or any(
-                re.search(pattern, context) is not None
-                for context in self.retrieval_context
+                re.search(
+                    pattern,
+                    c.context if isinstance(c, RetrievedContextData) else c,
+                )
+                for c in self.retrieval_context
+                if isinstance(c, (RetrievedContextData, str))
             )
         if self.context is not None:
             auto_detect = auto_detect or any(
@@ -447,10 +496,11 @@ class LLMTestCase(BaseModel):
         # Ensure `retrieval_context` is None or a list of strings
         if retrieval_context is not None:
             if not isinstance(retrieval_context, list) or not all(
-                isinstance(item, str) for item in retrieval_context
+                isinstance(item, (str, RetrievedContextData))
+                for item in retrieval_context
             ):
                 raise TypeError(
-                    "'retrieval_context' must be None or a list of strings"
+                    "'retrieval_context' must be None or a list of strings or RetrievedContextData"
                 )
 
         # Ensure `tools_called` is None or a list of strings
@@ -536,7 +586,7 @@ class LLMTestCase(BaseModel):
         return data
 
     def _get_images_mapping(self) -> Dict[str, MLLMImage]:
-        pattern = r"\[DEEPEVAL:IMAGE:(.*?)\]"
+        pattern = r"\[DEEPEVAL:(?:IMAGE|PDF):(.*?)\]"
         image_ids = set()
 
         def extract_ids_from_string(s: Optional[str]) -> None:

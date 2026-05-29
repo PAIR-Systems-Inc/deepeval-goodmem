@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "deepeval"
-version = "3.9.2"
+version = "4.0.4"
 description = "The LLM Evaluation Framework"
 authors = ["Jeffrey Ip <jeffreyip@confident-ai.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/confident-ai/deepeval"
 documentation = "https://deepeval.com"
-exclude = ["tests/*", "tracing_tests/*"]
+exclude = ["tests/*", "tracing_tests/*", "scripts/*"]
 
 [tool.poetry.scripts]
 deepeval = 'deepeval.cli.main:app'
@@ -39,12 +39,23 @@ tenacity = ">=8.0.0,<=10.0.0"
 opentelemetry-api = "^1.24.0"
 opentelemetry-sdk = "^1.24.0"
 grpcio = "^1.67.1"
-posthog = "^5.4.0, <7.0.0"
+
+posthog = [
+    { version = ">=5.4.0, <7.0.0", python = "<3.10" },
+    { version = ">=7.0.0, <8.0.0", python = ">=3.10" }
+]
+
 pyfiglet = "*"
 python-dotenv = "^1.1.1"
 pydantic = "^2.11.7"
 pydantic-settings = "^2.10.1"
 jinja2 = "*"
+
+textual = { version = ">=0.80,<2.0", optional = true }
+pyperclip = { version = "^1.8", optional = true }
+
+[tool.poetry.extras]
+inspect = ["textual", "pyperclip"]
 
 [tool.poetry.group.dev.dependencies]
 twine = "5.1.1"
@@ -90,9 +101,21 @@ optional = true
 
 [tool.poetry.group.integrations.dependencies]
 crewai = { version = "*", python = ">=3.10,<3.14" }
-pydantic-ai = { version = "*", python = ">=3.10,<3.14" }
+# Use pydantic-ai-slim with explicit extras instead of the meta-package
+# `pydantic-ai`, which transitively requires `pydantic-ai-slim[mistral]` →
+# `mistralai`. The `mistralai` project is currently quarantined on PyPI
+# (https://pypi.org/simple/mistralai/ shows
+# `<meta name="pypi:project-status" content="quarantined">` and serves no
+# files), which makes Poetry's resolution fail across every integrations
+# job. All test apps under tests/test_integrations/test_pydanticai use
+# `Agent("openai:gpt-4o-mini", ...)`, so the `openai` extra is the only
+# one we actually exercise; widen this list if a future test needs a
+# different provider.
+pydantic-ai-slim = { version = "*", extras = ["openai"], python = ">=3.10,<3.14" }
 llama-index = "^0.14.4"
 openai-agents = "^0.3.3"
+google-adk = { version = "*", python = ">=3.10,<3.15" }
+openinference-instrumentation-google-adk = { version = "*", python = ">=3.10,<3.15" }
 
 [tool.poetry.group.langchain]
 optional = true

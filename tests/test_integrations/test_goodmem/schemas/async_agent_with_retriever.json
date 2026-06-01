@@ -1,0 +1,89 @@
+{
+  "uuid": "569b388e-5077-4b6c-8480-9809fd4e2dfd",
+  "baseSpans": [],
+  "agentSpans": [
+    {
+      "uuid": "c8e3ff66-b3b1-4309-8017-4617dd2fd2ea",
+      "name": "Async RAG Agent",
+      "status": "SUCCESS",
+      "type": "agent",
+      "startTime": "2026-06-01T17:01:04.414Z",
+      "endTime": "2026-06-01T17:01:04.414Z",
+      "input": {
+        "retriever": {
+          "config": {
+            "base_url": "https://api.goodmem.ai",
+            "api_key": "test-key",
+            "space_ids": [
+              "space-async"
+            ],
+            "top_k": 5,
+            "reranker": null,
+            "relevance_threshold": null,
+            "metadata_filter": null,
+            "embedder": "text-embedding-ada-002",
+            "verify_ssl": true,
+            "wait_for_indexing": false,
+            "max_wait_seconds": 10.0,
+            "poll_interval": 2.0,
+            "space_id": "space-async"
+          }
+        },
+        "query": "async test query"
+      },
+      "output": [
+        "Async chunk one.",
+        "Async chunk two."
+      ],
+      "availableTools": [],
+      "agentHandoffs": []
+    }
+  ],
+  "llmSpans": [],
+  "retrieverSpans": [
+    {
+      "uuid": "3ae33d64-5d13-4ca6-a82f-56fcbc9503ef",
+      "name": "GoodMem Retriever",
+      "status": "SUCCESS",
+      "type": "retriever",
+      "parentUuid": "c8e3ff66-b3b1-4309-8017-4617dd2fd2ea",
+      "startTime": "2026-06-01T17:01:04.414Z",
+      "endTime": "2026-06-01T17:01:04.414Z",
+      "input": {
+        "self": "<GoodMemRetriever>",
+        "query": "async test query"
+      },
+      "output": [
+        {
+          "content": "Async chunk one.",
+          "score": -0.2,
+          "chunk_id": "c1",
+          "memory_id": "m1",
+          "space_id": ""
+        },
+        {
+          "content": "Async chunk two.",
+          "score": -0.35,
+          "chunk_id": "c2",
+          "memory_id": "m2",
+          "space_id": ""
+        }
+      ],
+      "embedder": "text-embedding-ada-002",
+      "topK": 5
+    }
+  ],
+  "toolSpans": [],
+  "startTime": "2026-06-01T17:01:04.414Z",
+  "endTime": "2026-06-01T17:01:04.414Z",
+  "environment": "development",
+  "input": {
+    "retriever": "<circular>",
+    "query": "async test query"
+  },
+  "output": [
+    "Async chunk one.",
+    "Async chunk two."
+  ],
+  "status": "SUCCESS"
+}

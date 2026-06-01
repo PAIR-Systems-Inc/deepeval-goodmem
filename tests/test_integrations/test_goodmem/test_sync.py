@@ -1,12 +1,22 @@
-"""Synchronous GoodMem tracing tests."""
+"""Synchronous GoodMem tracing tests.
+
+Trace structure is captured with the shared snapshot helper from
+``tests/test_integrations/utils.py`` and compared against the committed
+schemas under ``schemas/``. Regenerate them with::
+
+    GENERATE_SCHEMAS=true pytest tests/test_integrations/test_goodmem/test_sync.py
+
+Return-value and error-path behaviour are asserted directly, since those
+do not depend on the captured trace.
+"""
 
 import json
-from unittest.mock import patch, MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from deepeval.tracing import trace, observe
-from deepeval.tracing.tracing import trace_manager
+from deepeval.tracing import observe, trace
 from deepeval.tracing.types import RetrieverSpan, TraceSpanStatus
 
 from deepeval.integrations.goodmem import (
@@ -14,6 +24,23 @@ from deepeval.integrations.goodmem import (
     GoodMemConfig,
     GoodMemRetriever,
 )
+from tests.test_integrations.utils import (
+    assert_trace_json,
+    generate_trace_json,
+    is_generate_mode,
+)
+
+_SCHEMAS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "schemas"
+)
+
+
+def trace_test(schema_name: str):
+    schema_path = os.path.join(_SCHEMAS_DIR, schema_name)
+    if is_generate_mode():
+        return generate_trace_json(schema_path)
+    return assert_trace_json(schema_path)
+
 
 MOCK_NDJSON = "\n".join(
     [
@@ -56,8 +83,7 @@ def _mock_post(*args, **kwargs):
     return resp
 
 
-@pytest.fixture
-def retriever():
+def _make_retriever() -> GoodMemRetriever:
     return GoodMemRetriever(
         GoodMemConfig(
             base_url="https://api.goodmem.ai",
@@ -69,175 +95,61 @@ def retriever():
     )
 
 
-class TestRetrieverSpanCreation:
-    """`retrieve_chunks()` should create a single retriever span."""
+@observe(type="agent", name="RAG Agent")
+def _rag_agent(retriever: GoodMemRetriever, query: str):
+    return retriever.retrieve(query)
+
+
+class TestRetrieverTrace:
+    """Snapshot the trace structure a GoodMem retrieval produces."""
+
+    @trace_test("retriever_span.json")
+    def test_retriever_span(self):
+        with patch("requests.Session.post", side_effect=_mock_post):
+            _make_retriever().retrieve_chunks("What is Python?")
+
+    @trace_test("agent_with_retriever.json")
+    def test_agent_with_retriever(self):
+        with patch("requests.Session.post", side_effect=_mock_post):
+            _rag_agent(_make_retriever(), "What is Python?")
+
+
+class TestRetrieverReturns:
+    """The retrieve methods return the expected text and chunk objects."""
 
     @patch("requests.Session.post", side_effect=_mock_post)
-    def test_creates_retriever_span(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            retriever.retrieve_chunks("What is Python?")
-
-        traces = trace_manager.get_all_traces()
-        assert len(traces) == 1
-
-        root_spans = traces[0].root_spans
-        assert len(root_spans) == 1
-        assert isinstance(root_spans[0], RetrieverSpan)
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_span_has_correct_name(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            retriever.retrieve_chunks("test query")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert span.name == "GoodMem Retriever"
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_span_captures_input(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            retriever.retrieve_chunks("What is Python?")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert span.input is not None
-        assert "What is Python?" in str(span.input)
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_span_captures_output(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            result = retriever.retrieve_chunks("test")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert span.output is not None
-        assert len(result) == 2
-        assert isinstance(result[0], GoodMemChunk)
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_span_has_success_status(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            retriever.retrieve_chunks("test")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert span.status == TraceSpanStatus.SUCCESS
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_span_has_retriever_metadata(self, mock_post, retriever):
-        with trace(name="goodmem-test"):
-            retriever.retrieve_chunks("test")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert isinstance(span, RetrieverSpan)
-        assert span.embedder == "text-embedding-3-small"
-        assert span.top_k == 3
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_retrieve_returns_text_list(self, mock_post, retriever):
-        with trace(name="text-test"):
-            result = retriever.retrieve("test")
-
+    def test_retrieve_returns_texts(self, mock_post):
+        result = _make_retriever().retrieve("test query")
         assert result == [
             "Python is a programming language.",
             "Python was created by Guido van Rossum.",
         ]
 
-
-class TestTraceMetadata:
-    """Trace-level metadata should reach the recorded trace."""
-
     @patch("requests.Session.post", side_effect=_mock_post)
-    def test_trace_tags(self, mock_post, retriever):
-        with trace(
-            name="goodmem-tagged",
-            tags=["goodmem", "retrieval"],
-            thread_id="thread-abc",
-            user_id="user-xyz",
-        ):
-            retriever.retrieve("test")
-
-        t = trace_manager.get_all_traces()[0]
-        assert t.name == "goodmem-tagged"
-        assert "goodmem" in t.tags
-        assert "retrieval" in t.tags
-        assert t.thread_id == "thread-abc"
-        assert t.user_id == "user-xyz"
+    def test_retrieve_chunks_returns_structured(self, mock_post):
+        chunks = _make_retriever().retrieve_chunks("test query")
+        assert len(chunks) == 2
+        assert isinstance(chunks[0], GoodMemChunk)
+        assert chunks[0].content == "Python is a programming language."
+        assert chunks[0].score == -0.25
+        assert chunks[0].chunk_id == "c1"
+        assert chunks[0].memory_id == "m1"
 
 
-class TestSpanNesting:
-    """Retriever spans should nest correctly under parent spans."""
+class TestRetrieverErrors:
+    """A failed HTTP call surfaces as an errored retriever span."""
 
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_nested_inside_agent_span(self, mock_post, retriever):
-        @observe(type="agent", name="RAG Agent")
-        def rag_agent(query):
-            return retriever.retrieve(query)
-
-        with trace(name="nested-test"):
-            rag_agent("test query")
-
-        t = trace_manager.get_all_traces()[0]
-        assert len(t.root_spans) == 1
-        agent_span = t.root_spans[0]
-        assert agent_span.name == "RAG Agent"
-
-        assert len(agent_span.children) == 1
-        retriever_span = agent_span.children[0]
-        assert isinstance(retriever_span, RetrieverSpan)
-        assert retriever_span.name == "GoodMem Retriever"
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_multiple_retrieves_create_separate_traces(
-        self, mock_post, retriever
-    ):
-        retriever.retrieve("query 1")
-        retriever.retrieve("query 2")
-
-        traces = trace_manager.get_all_traces()
-        assert len(traces) == 2
-        assert all(isinstance(t.root_spans[0], RetrieverSpan) for t in traces)
-
-
-class TestRetrieveChunksSpan:
-    """`retrieve_chunks()` should also create traced spans."""
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_retrieve_chunks_creates_span(self, mock_post, retriever):
-        with trace(name="chunks-test"):
-            result = retriever.retrieve_chunks("What is Python?")
-
-        assert len(result) == 2
-        assert isinstance(result[0], GoodMemChunk)
-        assert result[0].score == -0.25
-
-        traces = trace_manager.get_all_traces()
-        assert len(traces) == 1
-        span = traces[0].root_spans[0]
-        assert isinstance(span, RetrieverSpan)
-        assert span.name == "GoodMem Retriever"
-        assert span.status == TraceSpanStatus.SUCCESS
-
-    @patch("requests.Session.post", side_effect=_mock_post)
-    def test_retrieve_chunks_has_metadata(self, mock_post, retriever):
-        with trace(name="chunks-meta-test"):
-            retriever.retrieve_chunks("test")
-
-        span = trace_manager.get_all_traces()[0].root_spans[0]
-        assert isinstance(span, RetrieverSpan)
-        assert span.embedder == "text-embedding-3-small"
-        assert span.top_k == 3
-
-
-class TestErrorHandling:
-    """Errors raised during retrieval should land on the retriever span."""
-
-    def test_span_captures_error(self, retriever):
-        with patch(
-            "requests.Session.post",
-            side_effect=Exception("Connection refused"),
-        ):
-            with trace(name="error-test"):
+    def test_span_errored_on_http_failure(self):
+        retriever = _make_retriever()
+        with trace() as active_trace:
+            with patch(
+                "requests.Session.post",
+                side_effect=Exception("Connection refused"),
+            ):
                 with pytest.raises(Exception, match="Connection refused"):
-                    retriever.retrieve("test")
+                    retriever.retrieve("test query")
 
-        t = trace_manager.get_all_traces()[0]
-        span = t.root_spans[0]
-        assert span.status == TraceSpanStatus.ERRORED
-        assert span.error is not None
+            span = active_trace.root_spans[0]
+            assert isinstance(span, RetrieverSpan)
+            assert span.status == TraceSpanStatus.ERRORED
+            assert span.error is not None

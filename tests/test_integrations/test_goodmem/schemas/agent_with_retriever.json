@@ -1,0 +1,107 @@
+{
+  "uuid": "9b0fb962-76e2-4436-9c62-49a3f0fb9116",
+  "baseSpans": [],
+  "agentSpans": [
+    {
+      "uuid": "a7695bae-62c5-4463-980f-35ec33aeeb8c",
+      "name": "RAG Agent",
+      "status": "SUCCESS",
+      "type": "agent",
+      "startTime": "2026-06-01T17:01:04.395Z",
+      "endTime": "2026-06-01T17:01:04.395Z",
+      "input": {
+        "retriever": {
+          "config": {
+            "base_url": "https://api.goodmem.ai",
+            "api_key": "test-key",
+            "space_ids": [
+              "space-123"
+            ],
+            "top_k": 3,
+            "reranker": null,
+            "relevance_threshold": null,
+            "metadata_filter": null,
+            "embedder": "text-embedding-3-small",
+            "verify_ssl": true,
+            "wait_for_indexing": false,
+            "max_wait_seconds": 10.0,
+            "poll_interval": 2.0,
+            "space_id": "space-123"
+          }
+        },
+        "query": "What is Python?"
+      },
+      "output": [
+        "Python is a programming language.",
+        "Python was created by Guido van Rossum."
+      ],
+      "availableTools": [],
+      "agentHandoffs": []
+    }
+  ],
+  "llmSpans": [],
+  "retrieverSpans": [
+    {
+      "uuid": "c668b405-8c7c-4ce6-95e1-ac86b793b865",
+      "name": "GoodMem Retriever",
+      "status": "SUCCESS",
+      "type": "retriever",
+      "parentUuid": "a7695bae-62c5-4463-980f-35ec33aeeb8c",
+      "startTime": "2026-06-01T17:01:04.395Z",
+      "endTime": "2026-06-01T17:01:04.395Z",
+      "input": {
+        "self": "<GoodMemRetriever>",
+        "query": "What is Python?"
+      },
+      "output": [
+        {
+          "content": "Python is a programming language.",
+          "score": -0.25,
+          "chunk_id": "c1",
+          "memory_id": "m1",
+          "space_id": ""
+        },
+        {
+          "content": "Python was created by Guido van Rossum.",
+          "score": -0.4,
+          "chunk_id": "c2",
+          "memory_id": "m2",
+          "space_id": ""
+        }
+      ],
+      "embedder": "text-embedding-3-small",
+      "topK": 3
+    }
+  ],
+  "toolSpans": [],
+  "startTime": "2026-06-01T17:01:04.395Z",
+  "endTime": "2026-06-01T17:01:04.395Z",
+  "environment": "development",
+  "input": {
+    "retriever": {
+      "config": {
+        "base_url": "https://api.goodmem.ai",
+        "api_key": "test-key",
+        "space_ids": [
+          "space-123"
+        ],
+        "top_k": 3,
+        "reranker": null,
+        "relevance_threshold": null,
+        "metadata_filter": null,
+        "embedder": "text-embedding-3-small",
+        "verify_ssl": true,
+        "wait_for_indexing": false,
+        "max_wait_seconds": 10.0,
+        "poll_interval": 2.0,
+        "space_id": "space-123"
+      }
+    },
+    "query": "What is Python?"
+  },
+  "output": [
+    "Python is a programming language.",
+    "Python was created by Guido van Rossum."
+  ],
+  "status": "SUCCESS"
+}

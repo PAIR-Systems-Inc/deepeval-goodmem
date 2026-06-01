@@ -1,0 +1,63 @@
+{
+  "uuid": "48dc267a-c6d3-4158-bba5-9ccb117fd49f",
+  "baseSpans": [],
+  "agentSpans": [],
+  "llmSpans": [],
+  "retrieverSpans": [
+    {
+      "uuid": "19332943-2a07-4517-9a56-8cb4241037f4",
+      "name": "GoodMem Retriever",
+      "status": "SUCCESS",
+      "type": "retriever",
+      "startTime": "2026-06-01T17:01:04.389Z",
+      "endTime": "2026-06-01T17:01:04.390Z",
+      "input": {
+        "self": "<GoodMemRetriever>",
+        "query": "What is Python?"
+      },
+      "output": [
+        {
+          "content": "Python is a programming language.",
+          "score": -0.25,
+          "chunk_id": "c1",
+          "memory_id": "m1",
+          "space_id": ""
+        },
+        {
+          "content": "Python was created by Guido van Rossum.",
+          "score": -0.4,
+          "chunk_id": "c2",
+          "memory_id": "m2",
+          "space_id": ""
+        }
+      ],
+      "embedder": "text-embedding-3-small",
+      "topK": 3
+    }
+  ],
+  "toolSpans": [],
+  "startTime": "2026-06-01T17:01:04.389Z",
+  "endTime": "2026-06-01T17:01:04.390Z",
+  "environment": "development",
+  "input": {
+    "self": "<GoodMemRetriever>",
+    "query": "What is Python?"
+  },
+  "output": [
+    {
+      "content": "Python is a programming language.",
+      "score": -0.25,
+      "chunk_id": "c1",
+      "memory_id": "m1",
+      "space_id": ""
+    },
+    {
+      "content": "Python was created by Guido van Rossum.",
+      "score": -0.4,
+      "chunk_id": "c2",
+      "memory_id": "m2",
+      "space_id": ""
+    }
+  ],
+  "status": "SUCCESS"
+}

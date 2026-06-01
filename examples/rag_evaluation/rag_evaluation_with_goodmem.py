@@ -1,19 +1,21 @@
-"""GoodMem and DeepEval: retrieval, tracing, and grounded answers.
+"""Evaluate a GoodMem-backed RAG pipeline with DeepEval.
 
-Three scenarios drive the GoodMem integration through DeepEval's
-tracing layer:
-    1. Persistent project context across phases.
-    2. A two-role pipeline (Scribe and Analyst) with span metadata.
-    3. Metadata-driven retrieval with server-side filtering.
+GoodMem is the retrieval backend: documents are stored in a space, and
+``GoodMemRetriever`` pulls back the most relevant chunks for each question
+while recording the call as a retriever span. The retrieved chunks become
+the ``retrieval_context`` of an ``LLMTestCase``, an LLM produces a grounded
+answer, and DeepEval scores the result with its RAG metrics.
 
-Each scenario records a retriever span via ``GoodMemRetriever`` and an
-LLM span via an instrumented OpenAI call, so the full retrieve-and-answer
-flow shows up in the DeepEval trace.
+The script runs two evaluations:
+    1. Retrieval across the whole space, scored on a set of questions.
+    2. The same scoring with a server-side ``metadata_filter`` that scopes
+       retrieval to a single category.
 
 Required environment variables:
     GOODMEM_API_KEY        GoodMem API key.
     GOODMEM_BASE_URL       GoodMem server URL, e.g. https://localhost:8080.
-    OPENAI_API_KEY         OpenAI API key used for grounded answers.
+    OPENAI_API_KEY         OpenAI API key for answer generation and the
+                           metric judges.
 
 Optional:
     GOODMEM_VERIFY_SSL     Set to ``false`` for local dev with a
@@ -32,23 +34,59 @@ import urllib3.exceptions
 
 from openai import OpenAI
 
+from deepeval import evaluate
+from deepeval.evaluate import AsyncConfig, DisplayConfig
 from deepeval.integrations.goodmem import (
     GoodMemClient,
     GoodMemConfig,
     GoodMemRetriever,
 )
-from deepeval.tracing import (
-    observe,
-    trace,
-    update_current_span,
-    update_current_trace,
+from deepeval.metrics import (
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+    ContextualRelevancyMetric,
+    FaithfulnessMetric,
+)
+from deepeval.test_case import LLMTestCase
+
+GENERATION_MODEL = "gpt-4o-mini"
+SYSTEM_PROMPT = (
+    "Answer the user's question using only the provided context. If the "
+    "context does not contain the answer, say so plainly."
 )
 
-SYSTEM_PROMPT = (
-    "Answer the user's question accurately using only the provided "
-    "context. If the context lacks the answer, say so plainly."
+# Release-log knowledge base. Each entry is stored as one memory tagged with a
+# category, which the metadata_filter run later uses to scope retrieval.
+KNOWLEDGE_BASE = [
+    ("Added single sign-on (SSO) support via SAML to the dashboard.", "feat"),
+    ("Added a CSV export option to the billing reports page.", "feat"),
+    ("Fixed a crash when opening attachments larger than 25 MB.", "fix"),
+    (
+        "Fixed slow login on the mobile app by adding a missing database index.",
+        "fix",
+    ),
+    ("Upgraded the API gateway to require TLS 1.3 for all traffic.", "infra"),
+    ("Migrated the search backend to OpenSearch 2.13.", "infra"),
+]
+
+# Questions paired with the answer a grounded pipeline should produce.
+QUESTIONS = [
+    (
+        "What new features were shipped?",
+        "Single sign-on via SAML and a CSV export option for billing reports.",
+    ),
+    (
+        "What change was made to improve security?",
+        "The API gateway was upgraded to require TLS 1.3 for all traffic.",
+    ),
+]
+
+FEATURE_QUESTION = (
+    "Show me the new features we've shipped.",
+    "Single sign-on via SAML and a CSV export option for billing reports.",
 )
-GENERATION_MODEL = "gpt-4o-mini"
+FEATURE_FILTER = "CAST(val('$.category') AS TEXT) = 'feat'"
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -63,9 +101,8 @@ def _build_retriever(
     space_id: str,
     embedder_id: str,
     *,
-    top_k: int = 5,
+    top_k: int = 4,
     metadata_filter: str | None = None,
-    wait_for_indexing: bool = True,
 ) -> GoodMemRetriever:
     config = GoodMemConfig(
         base_url=client.base_url,
@@ -75,171 +112,70 @@ def _build_retriever(
         embedder=embedder_id,
         verify_ssl=client.verify_ssl,
         metadata_filter=metadata_filter,
-        wait_for_indexing=wait_for_indexing,
-        max_wait_seconds=20.0,
-        poll_interval=2.0,
+        wait_for_indexing=True,
+        max_wait_seconds=30.0,
+        poll_interval=3.0,
     )
     return GoodMemRetriever(config, client=client)
 
 
-@observe(type="llm", model=GENERATION_MODEL)
-def grounded_answer(
-    openai_client: OpenAI, query: str, context: list[str]
+def _rag_metrics() -> list:
+    return [
+        AnswerRelevancyMetric(),
+        FaithfulnessMetric(),
+        ContextualPrecisionMetric(),
+        ContextualRecallMetric(),
+        ContextualRelevancyMetric(),
+    ]
+
+
+def generate_answer(
+    openai_client: OpenAI, question: str, context: list[str]
 ) -> str:
+    """Answer a question grounded only in the retrieved context."""
+    joined = "\n".join(f"- {c}" for c in context) or "(no context retrieved)"
     response = openai_client.chat.completions.create(
         model=GENERATION_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    f"Context:\n{chr(10).join(context)}\n\n"
-                    f"Question: {query}"
-                ),
+                "content": f"Context:\n{joined}\n\nQuestion: {question}",
             },
         ],
     )
-    answer = response.choices[0].message.content or ""
-    update_current_span(input=query, output=answer)
-    return answer
+    return (response.choices[0].message.content or "").strip()
 
 
-@observe(type="agent", name="Scribe")
-def scribe_store_notes(
-    client: GoodMemClient, space_id: str, notes: list[str]
-) -> None:
-    update_current_span(metadata={"role": "scribe"})
-    for note in notes:
-        client.create_memory(space_id=space_id, text_content=note)
-
-
-@observe(type="agent", name="Analyst")
-def analyst_answer(
+def build_test_case(
     retriever: GoodMemRetriever,
     openai_client: OpenAI,
-    query: str,
-) -> str:
-    update_current_span(metadata={"role": "analyst"})
-    chunks = retriever.retrieve(query)
-    return grounded_answer(openai_client, query, chunks)
+    question: str,
+    expected_output: str,
+) -> LLMTestCase:
+    """Retrieve from GoodMem, generate an answer, and wrap both in a test case."""
+    context = retriever.retrieve(question)
+    answer = generate_answer(openai_client, question, context)
+    return LLMTestCase(
+        input=question,
+        actual_output=answer,
+        expected_output=expected_output,
+        retrieval_context=context,
+    )
 
 
-def scenario_persistent_context(
-    client: GoodMemClient,
-    openai_client: OpenAI,
-    space_id: str,
-    embedder_id: str,
-) -> None:
-    print("\n=== Scenario 1: Persistent project context across phases ===")
-    facts = [
-        "I'm building a customer support assistant for our SaaS product.",
-        "The team uses Python 3.12 with FastAPI and Postgres.",
-        "For tests we use pytest with at least 80% coverage required.",
-    ]
+def print_summary(title: str, result) -> None:
+    """Print the mean score for each metric across the evaluated test cases."""
+    totals: dict[str, list[float]] = {}
+    for test_result in result.test_results:
+        for metric in test_result.metrics_data or []:
+            if metric.score is not None:
+                totals.setdefault(metric.name, []).append(metric.score)
 
-    with trace(
-        name="goodmem-scenario-persistent",
-        tags=["goodmem", "scenario-1"],
-    ):
-        update_current_trace(metadata={"scenario": "persistent-context"})
-        for fact in facts:
-            client.create_memory(space_id=space_id, text_content=fact)
-            print(f"  stored: {fact}")
-
-        retriever = _build_retriever(client, space_id, embedder_id, top_k=3)
-        question = "Remind me what our coverage requirement is."
-        chunks = retriever.retrieve(question)
-        answer = grounded_answer(openai_client, question, chunks)
-
-    print(f"\nUser:  {question}")
-    print(f"Agent: {answer}")
-    for idx, chunk in enumerate(chunks, start=1):
-        print(f"  chunk {idx}: {chunk}")
-
-
-def scenario_two_role_pipeline(
-    client: GoodMemClient,
-    openai_client: OpenAI,
-    space_id: str,
-    embedder_id: str,
-) -> None:
-    print("\n=== Scenario 2: Two-role pipeline (Scribe + Analyst) ===")
-    notes = [
-        "Q2 goal: reduce customer support response time to under 2 hours.",
-        (
-            "Our main services are auth-service, billing-service, and "
-            "notifications-service."
-        ),
-        (
-            "Known issue: notifications-service drops messages during "
-            "high load."
-        ),
-        (
-            "Team retro: the CI pipeline is too slow; we should "
-            "parallelize tests."
-        ),
-    ]
-
-    with trace(
-        name="goodmem-scenario-two-role",
-        tags=["goodmem", "scenario-2"],
-    ):
-        update_current_trace(metadata={"scenario": "two-role-pipeline"})
-        scribe_store_notes(client, space_id, notes)
-
-        retriever = _build_retriever(client, space_id, embedder_id, top_k=4)
-        question = "What do we know about our services and current priorities?"
-        answer = analyst_answer(retriever, openai_client, question)
-
-    print(f"\nUser:  {question}")
-    print(f"Agent: {answer}")
-
-
-def scenario_metadata_filter(
-    client: GoodMemClient,
-    openai_client: OpenAI,
-    space_id: str,
-    embedder_id: str,
-) -> None:
-    print("\n=== Scenario 3: Metadata-driven retrieval ===")
-    entries = [
-        ("Added user profile editing to the dashboard.", "feat"),
-        ("Built the CSV export feature.", "feat"),
-        ("Resolved slow login on the mobile app.", "fix"),
-        ("Fixed crash when opening large attachments.", "fix"),
-        ("Upgraded Python version across services.", "chore"),
-        ("Updated the API reference for billing endpoints.", "docs"),
-    ]
-
-    with trace(
-        name="goodmem-scenario-metadata",
-        tags=["goodmem", "scenario-3"],
-    ):
-        update_current_trace(metadata={"scenario": "metadata-filter"})
-        for content, category in entries:
-            client.create_memory(
-                space_id=space_id,
-                text_content=content,
-                metadata={"category": category},
-            )
-            print(f"  stored ({category}): {content}")
-
-        feat_retriever = _build_retriever(
-            client,
-            space_id,
-            embedder_id,
-            top_k=6,
-            metadata_filter="CAST(val('$.category') AS TEXT) = 'feat'",
-        )
-        question = "Show me the new features we've shipped."
-        chunks = feat_retriever.retrieve(question)
-        answer = grounded_answer(openai_client, question, chunks)
-
-    print(f"\nUser:  {question}")
-    print(f"Agent: {answer}")
-    print("\n  filtered chunks (feat only):")
-    for idx, chunk in enumerate(chunks, start=1):
-        print(f"    {idx}. {chunk}")
+    print(f"\n{title}")
+    for name, scores in totals.items():
+        mean = sum(scores) / len(scores)
+        print(f"  {name}: {mean:.2f} (n={len(scores)})")
 
 
 def main() -> None:
@@ -257,37 +193,56 @@ def main() -> None:
         )
     embedder_id = embedders[0]["embedderId"]
 
-    project_space = client.create_space(
-        name="deepeval-goodmem-project", embedder_id=embedder_id
+    space_id = client.create_space(
+        name="deepeval-goodmem-rag-eval", embedder_id=embedder_id
     )["spaceId"]
-    team_space = client.create_space(
-        name="deepeval-goodmem-team", embedder_id=embedder_id
-    )["spaceId"]
-    tagged_space = client.create_space(
-        name="deepeval-goodmem-tagged", embedder_id=embedder_id
-    )["spaceId"]
+    for content, category in KNOWLEDGE_BASE:
+        client.create_memory(
+            space_id=space_id,
+            text_content=content,
+            metadata={"category": category},
+        )
+
+    async_config = AsyncConfig(max_concurrent=2, throttle_value=1)
+    display_config = DisplayConfig(inspect_after_run=False)
 
     try:
-        scenario_persistent_context(
-            client, openai_client, project_space, embedder_id
+        retriever = _build_retriever(client, space_id, embedder_id)
+        cases = [
+            build_test_case(retriever, openai_client, question, expected)
+            for question, expected in QUESTIONS
+        ]
+        unfiltered = evaluate(
+            test_cases=cases,
+            metrics=_rag_metrics(),
+            async_config=async_config,
+            display_config=display_config,
         )
-        scenario_two_role_pipeline(
-            client, openai_client, team_space, embedder_id
+
+        feat_retriever = _build_retriever(
+            client,
+            space_id,
+            embedder_id,
+            top_k=6,
+            metadata_filter=FEATURE_FILTER,
         )
-        scenario_metadata_filter(
-            client, openai_client, tagged_space, embedder_id
+        question, expected = FEATURE_QUESTION
+        filtered_case = build_test_case(
+            feat_retriever, openai_client, question, expected
+        )
+        filtered = evaluate(
+            test_cases=[filtered_case],
+            metrics=_rag_metrics(),
+            async_config=async_config,
+            display_config=display_config,
         )
     finally:
-        for space in (project_space, team_space, tagged_space):
-            try:
-                client.delete_space(space)
-            except Exception as cleanup_error:
-                print(f"  cleanup warning for {space}: {cleanup_error}")
+        client.delete_space(space_id)
         client.close()
 
-    print(
-        "\nDone. View the recorded traces on the Confident AI dashboard "
-        "(deepeval login) or in the local trace manager."
+    print_summary("Mean scores, retrieval across the whole space:", unfiltered)
+    print_summary(
+        "Mean scores, retrieval filtered to the feat category:", filtered
     )
 
 

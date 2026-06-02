@@ -8,8 +8,9 @@ answer, and DeepEval scores the result with its RAG metrics.
 
 The script runs two evaluations:
     1. Retrieval across the whole space, scored on a set of questions.
-    2. The same scoring with a server-side ``metadata_filter`` that scopes
-       retrieval to a single category.
+    2. The first question re-scored with a server-side ``metadata_filter``
+       that scopes retrieval to a single category, for a same-question
+       comparison.
 
 Required environment variables:
     GOODMEM_API_KEY        GoodMem API key.
@@ -82,10 +83,6 @@ QUESTIONS = [
     ),
 ]
 
-FEATURE_QUESTION = (
-    "Show me the new features we've shipped.",
-    "Single sign-on via SAML and a CSV export option for billing reports.",
-)
 FEATURE_FILTER = "CAST(val('$.category') AS TEXT) = 'feat'"
 
 
@@ -226,7 +223,9 @@ def main() -> None:
             top_k=6,
             metadata_filter=FEATURE_FILTER,
         )
-        question, expected = FEATURE_QUESTION
+        # Re-run the first question with the server-side filter so the
+        # scores compare directly against the same question in pass 1.
+        question, expected = QUESTIONS[0]
         filtered_case = build_test_case(
             feat_retriever, openai_client, question, expected
         )
